@@ -37,6 +37,7 @@ from frontier.moe_load_imbalance import MOE_LOAD_IMBALANCE_FEATURES
 from frontier.operators.typed_contracts import (
     TYPED_OPERATOR_CONTRACTS_COLUMN,
     validate_typed_operator_contracts,
+    validate_typed_operator_metadata,
 )
 from frontier.profiling.cpu_overhead.validation import (
     apply_cpu_overhead_schema_v2_defaults,
@@ -47,6 +48,10 @@ from typing import Any, Dict, List, Optional, cast
 
 
 logger = init_logger(__name__)
+
+
+class MissingLinearOpSamples(ValueError):
+    """The selected TP has no usable measurements (not a malformed schema)."""
 
 
 class ProfilingDataFrameLoaders:
@@ -60,6 +65,7 @@ class ProfilingDataFrameLoaders:
         training_context: Optional[Dict[str, Any]] = None,
         layer_contract: Optional[ResolvedLayerContract] = None,
         operator_name: Optional[str] = None,
+        replicated_operator: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Load linear operation dataframe (linear_op.csv or mlp.csv) with tensor parallel filtering.
@@ -155,6 +161,29 @@ class ProfilingDataFrameLoaders:
             pd.DataFrame,
             df[df["num_tensor_parallel_workers"] == tensor_parallel_size],
         )
+        if parsed_typed_contracts is not None and replicated_operator is not None:
+            # Row TP describes where the sample was measured. The replicated
+            # operator itself uses a TP1 contract even in a role-TP>1 row.
+            def owns_replicated_sample(contracts):
+                op = contracts.get(replicated_operator)
+                if op is None:
+                    return False
+                try:
+                    validate_typed_operator_metadata(
+                        op, operator_name=replicated_operator,
+                        expected_metadata={
+                            "profile_id": training_context["model_architecture_profile"],
+                            "tensor_parallel_mode": "replicated", "selected_tensor_parallel_size": 1,
+                            "expert_parallel_mode": "off", "layer_kind": None,
+                        },
+                        expected_tensor_parallel_sizes=(1,),
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"{file_path} (measurement TP={tensor_parallel_size}): {exc}") from exc
+                return True
+
+            mask = parsed_typed_contracts.loc[filtered_df.index].map(owns_replicated_sample)
+            filtered_df = cast(pd.DataFrame, filtered_df.loc[mask.astype(bool)])
         if parsed_typed_contracts is not None and layer_contract is not None:
             selected_layer_contract = layer_contract
             if not isinstance(operator_name, str) or not operator_name:
@@ -218,7 +247,7 @@ class ProfilingDataFrameLoaders:
                 if layer_contract is not None
                 else "legacy model width"
             )
-            raise ValueError(
+            raise MissingLinearOpSamples(
                 f"No data matches the filtering criteria in {file_path}\n"
                 f"Required tensor_parallel_size: {tensor_parallel_size}\n"
                 f"Available tensor_parallel_sizes: {available_tp}\n"
@@ -280,7 +309,8 @@ class ProfilingDataFrameLoaders:
             if training_context:
                 context_text = f"\nTraining context: {training_context}"
 
-            raise ValueError(
+            error = ValueError if missing_columns else MissingLinearOpSamples
+            raise error(
                 "Required attention linear op columns are missing or all-NaN in "
                 f"{file_path}."
                 f"\nMissing columns: {missing_columns}"

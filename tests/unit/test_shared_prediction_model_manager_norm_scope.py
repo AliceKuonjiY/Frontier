@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
-from frontier.config.model_config import BaseModelConfig
+from frontier.config.model_config import BaseModelConfig, Llama2_7BModelConfig
 from frontier.execution_time_predictor.shared_prediction_model_manager import (
     ExecutionTimePredictionModelManager,
 )
@@ -47,7 +50,7 @@ def test_decode_attn_trains_role_local_h200_norm_and_overrides_ffn_view(
             "time_stats.post_attention_layernorm.median": [0.001632],
         }
     )
-    manager._load_linear_op_df = lambda path, tp: (
+    manager._load_linear_op_df = lambda path, tp, **kwargs: (
         load_calls.append((path, tp)) or layernorm_df
     )
     sentinel = SimpleNamespace(name="h200-role-local-norm")
@@ -110,3 +113,68 @@ def test_decode_attn_trains_role_local_h200_norm_and_overrides_ffn_view(
 
     assert attn_view["post_attention_layernorm"] is sentinel
     assert ffn_view["post_attention_layernorm"] is hpp2_norm
+
+@pytest.mark.parametrize(("tp2", "selected_tp", "expected"), [
+    (0.001632, 2, 0.001632), (float("nan"), 1, 0.003), (None, 1, 0.003), ("unpaired", 1, 0.003),
+])
+def test_decode_attn_prefers_measured_tp_and_falls_back_only_for_missing_samples(
+    tmp_path, tp2, selected_tp, expected,
+):
+    manager = _manager()
+    replica = SimpleNamespace(device="h200", model_name="Qwen3-4B",
+        model_config=BaseModelConfig.create_from_name("Qwen3-4B"), attn_tensor_parallel_size=2)
+    target = "time_stats.post_attention_layernorm.median"
+    rows = [{"num_tensor_parallel_workers": 1, "num_tokens": 8, "use_qk_norm": True, target: 0.003}]
+    if tp2 == "unpaired":
+        rows.extend([dict(rows[0], num_tensor_parallel_workers=2, num_tokens=float("nan")),
+                     dict(rows[0], num_tensor_parallel_workers=2, **{target: float("nan")})])
+    elif tp2 is not None:
+        rows.append(dict(rows[0], num_tensor_parallel_workers=2, **{target: tp2}))
+    path = tmp_path / "linear.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    manager._train_single_model = lambda **kw: (kw["training_context"]["tensor_parallel_size"], kw["df"][target].iloc[0])
+    args = dict(cluster_type=ClusterType.DECODE_ATTN, replica_config=replica,
+                execution_time_predictor_config=None, linear_ops_file=str(path), trained_model_signatures=set())
+    assert manager._train_post_attention_layernorm_for_cluster(**args) == (selected_tp, expected)
+    # Without a target column there is no legitimate fallback on any TP.
+    manager._cluster_scoped_models.clear()
+    pd.DataFrame(rows).drop(columns=target).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="Missing columns"):
+        manager._train_post_attention_layernorm_for_cluster(**args)
+
+
+def test_typed_tp_row_cannot_supply_another_operators_norm_sample(tmp_path):
+    # Use actual canonical metadata, but remove the norm from the measured TP2
+    # row while leaving a tempting non-empty timing. TP1 still owns this op.
+    source = Path(__file__).resolve().parents[2] / "data/profiling/compute/h200/llama2_7b_dense_example/linear_op.csv"
+    df = pd.read_csv(source)
+    first = df[df.num_tensor_parallel_workers == 1].iloc[[0]].copy()
+    second = first.copy()
+    second["num_tensor_parallel_workers"] = 2
+    contracts = json.loads(second["typed_operator_contracts"].iloc[0])
+    norm_contract = contracts.pop("post_attention_layernorm")
+    second["typed_operator_contracts"] = json.dumps(contracts)
+    target = "time_stats.post_attention_layernorm.median"
+    first[target], second[target] = 0.003, 99.0
+    path = tmp_path / "typed.csv"
+    pd.concat([first, second]).to_csv(path, index=False)
+    manager = _manager()
+    manager._train_single_model = lambda **kw: kw["df"][target].iloc[0]
+    replica = SimpleNamespace(device="h200", model_name="llama2_7b_dense_example",
+        model_config=Llama2_7BModelConfig(), attn_tensor_parallel_size=2)
+    assert manager._train_post_attention_layernorm_for_cluster(
+        cluster_type=ClusterType.DECODE_ATTN, replica_config=replica,
+        execution_time_predictor_config=None, linear_ops_file=str(path), trained_model_signatures=set(),
+    ) == 0.003
+
+    # A declaration that conflicts with the active profile is malformed, not
+    # an excuse to fall back to the valid TP1 row.
+    contracts["post_attention_layernorm"] = dict(norm_contract, profile_id="wrong_profile")
+    second["typed_operator_contracts"] = json.dumps(contracts)
+    pd.concat([first, second]).to_csv(path, index=False)
+    manager._cluster_scoped_models.clear()
+    with pytest.raises(ValueError, match="measurement TP=2.*profile_id"):
+        manager._train_post_attention_layernorm_for_cluster(
+            cluster_type=ClusterType.DECODE_ATTN, replica_config=replica,
+            execution_time_predictor_config=None, linear_ops_file=str(path), trained_model_signatures=set(),
+        )

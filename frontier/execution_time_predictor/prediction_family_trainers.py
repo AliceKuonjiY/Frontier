@@ -45,6 +45,7 @@ from frontier.execution_time_predictor.prediction_model_identity import (
     _resolve_model_architecture_profile_id,
     _serialize_selected_layer_cache_identity,
 )
+from frontier.execution_time_predictor.profiling_dataframe_loaders import MissingLinearOpSamples
 from frontier.logger import init_logger
 from frontier.model_architectures import ResolvedLayerContract
 from frontier.moe_gating_runtime import (
@@ -536,7 +537,6 @@ class PredictionFamilyTrainers(KernelCountTraining):
             replica_config,
             is_moe_model=is_moe_model,
         )
-        layernorm_df = self._load_linear_op_df(linear_ops_file, tp_key)
         family_name = self._measurement_family_name(self._active_measurement_type)
         scoped_key = (family_name, cluster_type, "post_attention_layernorm")
         scoped_models = getattr(self, "_cluster_scoped_models", None)
@@ -565,11 +565,41 @@ class PredictionFamilyTrainers(KernelCountTraining):
             "network_device": getattr(replica_config, "network_device", ""),
             "block_size": getattr(self, "_block_size", None),
         }
+        target = "time_stats.post_attention_layernorm.median"
+        # Replicated ops can have a role-TP measurement as well as a TP1
+        # measurement. Prefer the former; only missing samples warrant fallback.
+        preferred_tp = (
+            getattr(replica_config, "attn_tensor_parallel_size", tp_key)
+            if tp_key == 1 else tp_key
+        )
+        training_context["use_qk_norm"] = bool(getattr(model_config, "use_qk_norm", False))
+
+        def load(tp: int) -> pd.DataFrame:
+            training_context["tensor_parallel_size"] = tp
+            rows = self._load_linear_op_df(
+                linear_ops_file, tp, required_columns=["num_tokens", target], training_context=training_context,
+                replicated_operator="post_attention_layernorm" if tp_key == 1 else None,
+            )
+            # Fitting drops rows with a missing feature OR target. Check their
+            # intersection, not just whether each column has a value somewhere.
+            if not rows[["num_tokens", target]].notna().all(axis=1).any():
+                raise MissingLinearOpSamples(f"{linear_ops_file}: no paired norm samples at TP={tp}")
+            return rows
+
+        try:
+            layernorm_df = load(preferred_tp)
+        except MissingLinearOpSamples:
+            if preferred_tp == tp_key:
+                raise
+            layernorm_df = load(tp_key)
+        else:
+            tp_key = preferred_tp
+
         model = self._train_single_model(
             model_name="post_attention_layernorm",
             df=layernorm_df,
             feature_cols=["num_tokens"],
-            target_col="time_stats.post_attention_layernorm.median",
+            target_col=target,
             execution_time_predictor_config=execution_time_predictor_config,
             training_context=training_context,
             # Keep the global bare key owned by the FFN trainer; this instance
