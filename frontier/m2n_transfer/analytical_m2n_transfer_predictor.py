@@ -12,7 +12,14 @@ if TYPE_CHECKING:
 
 
 class AnalyticalM2NTransferPredictor(BaseM2NTransferPredictor):
-    """Analytical M2N transfer predictor using bandwidth and latency."""
+    """Analytical M2N transfer predictor using bandwidth and latency.
+
+    For the HPP2 HostBounce path, ``memory_bandwidth_gbps`` prices the IB
+    segment and the HPP2 CPU-overhead table prices the per-layer PCIe
+    segment.  The two segments are serial.  Do not set the 122.44 Gbps
+    HostBounce single-segment effective bandwidth here while also applying
+    the per-layer PCIe CPU overhead; that double-counts the PCIe copy.
+    """
 
     def __init__(self, config: "AnalyticalM2NTransferConfig") -> None:
         super().__init__(config)

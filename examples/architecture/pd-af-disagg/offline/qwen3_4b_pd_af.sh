@@ -11,7 +11,11 @@
 #   network/h200_prefill_to_decode_attn/kv_cache_transfer_lut.csv
 #
 # The analytical M2N/KV/CC settings below are fitted from those LUTs:
-#   M2N Direct: 366 Gbps, 0 latency, no 1.2x p2p speedup
+#   M2N HostBounce (segmented): IB 366 Gbps + per-layer HPP2 PCIe 23 GB/s
+#     - the IB segment is priced by the analytical M2N bandwidth
+#     - the PCIe segment is priced by the per-layer HPP2 CPU-overhead table
+#     - the two segments are serial; do not also use the 122.44 Gbps
+#       HostBounce single-segment effective bandwidth
 #   KV NVLink:  3172.5 Gbps, 0.0208 ms latency
 #   HPP2 ring:  2984 Gbps intra-node (373 GB/s), 0 latency
 
@@ -57,6 +61,14 @@ for path in "${REQUIRED[@]}"; do
     exit 2
   fi
 done
+
+# The per-layer HPP2 CPU overhead is the HostBounce PCIe segment.
+# Warn if a replacement table no longer declares that source.
+HPP2_CPU_OVERHEAD_TABLE="data/profiling/cpu_overhead/hpp2_16rank/Qwen3-4B/cpu_overheads_kernel_only.csv"
+if ! grep -qi "hostbounce" "$HPP2_CPU_OVERHEAD_TABLE"; then
+  echo "WARNING: $HPP2_CPU_OVERHEAD_TABLE does not declare a hostbounce source;" >&2
+  echo "         per-layer prepare/process may no longer be the HostBounce PCIe segment." >&2
+fi
 
 case "$WEIGHT_STREAM_LAYERS" in
   0) CPU_OVERHEAD_TEMPLATE="" ;;
@@ -154,6 +166,9 @@ CMD=(
   --kv_cache_transfer_config_type analytical
 
   # Fitted from the filled M2N / KV / all-reduce LUTs.
+  # M2N HostBounce is segmented: 366 Gbps is the IB segment; the per-layer
+  # PCIe segment is carried by the HPP2 CPU-overhead table (23 GB/s).
+  --analytical_m2_n_transfer_config_p2p_protocol host_bounce
   --analytical_m2_n_transfer_config_memory_bandwidth_gbps 366.0
   --analytical_m2_n_transfer_config_network_latency_ms 0.0
   --no-analytical_m2_n_transfer_config_enable_p2p_optimization

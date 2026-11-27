@@ -51,7 +51,16 @@ class BaseM2NTransferConfig(BasePolyConfig):
     )
     p2p_protocol: str = field(
         default="nvlink",
-        metadata={"help": "P2P transfer protocol: nvlink, pcie, rdma."},
+        metadata={
+            "help": (
+                "P2P transfer protocol: nvlink, pcie, rdma, host_bounce. "
+                "For the HPP2 HostBounce path, set host_bounce; "
+                "memory_bandwidth_gbps prices the IB segment and the HPP2 "
+                "CPU-overhead table prices the per-layer PCIe segment. "
+                "Do not also apply the 122.44 Gbps HostBounce single-segment "
+                "effective bandwidth."
+            )
+        },
     )
     
     # Future extension configuration

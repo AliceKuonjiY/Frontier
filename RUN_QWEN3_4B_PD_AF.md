@@ -94,9 +94,10 @@ requests/s            63.53  （仿真聚合值）
 DECODE_ATTN E2E      90.89 ms / 63 个后续 decode step
 DECODE_FFN E2E        9.46 ms / 63 个后续 decode step
 KV transfer           1.69 ms 总计（8 次传输）
-M2N transfer          4.06 ms 总计（4536 次传输）
+M2N transfer          4.06 ms 总计（4536 次传输，IB 段；PCIe 段在 FFN residence 的 CPU overhead 中）
 ```
 
+`DECODE_FFN E2E 9.46 ms` 是 HostBounce residence，包含每层 FFN 输入/输出的 PCIe CPU overhead，不是 FFN 计算时间。  
 每步 FFN 计算相比 H200 attention 很小；对这个 4B dense 模型，AF 分离是
 **attention 主导**。HPP2 FFN 集群仍有价值，但更适合作为容量/通信研究，
 而不是延迟瓶颈。
@@ -159,14 +160,21 @@ DECODE_FFN E2E    47.830 ms / 63 个后续 decode step
      权重宽度计算（FP8 为 1 byte），不再固定按 2 bytes。
    - 在 TP16 配置下，每个 HPP2 rank 的 36 层 FFN 权重共 168,099,840 字节。流式 3 层时，33 层常驻权重占 154,091,520 字节，串行传输另留一个 4,669,440 字节的单层暂存区，两项合计 158,760,960 字节（158.76 MB）。`system_metrics.json` 的 `model_weight_memory.DECODE_FFN.weight_residency` 分别列出常驻、离卡和计划暂存字节数。
 
+5. **HPP2 M2N / CPU overhead 口径**
+   - M2N 统一按 **HostBounce 分段** 解释：`p2p_protocol=host_bounce`，`memory_bandwidth_gbps=366` 只计 IB 段；每层 FFN 输入/输出的 PCIe 拷贝由 HPP2 CPU-overhead 表的 `prepare_inputs_e2e` / `process_model_outputs` 按层计。
+   - 两段串行，不要再用 122.44 Gbps 的 HostBounce 单段有效带宽，否则会重复计 PCIe。
+   - 如果实测路径是 Direct RDMA，则 CPU 表应清零、M2N 用 366 Gbps；当前脚本默认按 HostBounce。
+
 ## 从 LUT 拟合的 analytical 参数
 
 | 路径 | 设置 |
 |---|---|
-| M2N direct | 366 Gbps，0 ms latency，关闭 p2p speedup |
+| M2N HostBounce（分段） | IB 366 Gbps，0 ms latency，关闭 p2p speedup；每层 HPP2 PCIe 23 GB/s 在 CPU overhead 表 |
 | KV prefill→decode_attn（NVLink） | 3172.5 Gbps，0.0208 ms latency |
 | HPP2 ring all-reduce | 2984 Gbps 节点内，0 latency |
 | H200 clusters | 使用同一套 analytical CC 设置；未安装 H200 all-reduce 表 |
+
+> HPP2 M2N 采用 **HostBounce 分段口径**：`analytical_m2_n_transfer_config_memory_bandwidth_gbps=366` 只计 IB 段；每层 FFN 的输入/输出 PCIe 拷贝（23 GB/s）由 HPP2 CPU-overhead 表的 `prepare_inputs_e2e` / `process_model_outputs` 按层计。两段串行，不要再叠加 122.44 Gbps 的 HostBounce 单段有效带宽，否则会重复计 PCIe。
 
 ## 注意事项
 

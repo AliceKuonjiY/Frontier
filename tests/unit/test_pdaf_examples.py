@@ -367,6 +367,21 @@ def test_qwen3_4b_pdaf_script_uses_network_device_template_for_weight_streaming(
     assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_streamed_ffn_layers") == "3"
 
 
+def test_qwen3_4b_pdaf_uses_host_bounce_m2n_segment(tmp_path: Path) -> None:
+    argv = _capture_cli(
+        tmp_path,
+        "offline/qwen3_4b_pd_af.sh",
+        env_overrides={"OUT_DIR": (tmp_path / "out").as_posix()},
+    )
+
+    assert _option_value(
+        argv, "--analytical_m2_n_transfer_config_p2p_protocol"
+    ) == "host_bounce"
+    assert _option_value(
+        argv, "--analytical_m2_n_transfer_config_memory_bandwidth_gbps"
+    ) == "366.0"
+
+
 def test_qwen3_4b_default_uses_burst_arrivals(tmp_path: Path) -> None:
     argv = _capture_cli(
         tmp_path,
