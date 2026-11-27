@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
-from frontier.config.model_config import BaseModelConfig
+from frontier.config.model_config import BaseModelConfig, Llama2_7BModelConfig
 from frontier.execution_time_predictor.shared_prediction_model_manager import (
     ExecutionTimePredictionModelManager,
 )
@@ -136,3 +138,28 @@ def test_decode_attn_prefers_measured_tp_and_falls_back_only_for_missing_samples
     pd.DataFrame(rows).drop(columns=target).to_csv(path, index=False)
     with pytest.raises(ValueError, match="Missing columns"):
         manager._train_post_attention_layernorm_for_cluster(**args)
+
+
+def test_typed_tp_row_cannot_supply_another_operators_norm_sample(tmp_path):
+    # Use actual canonical metadata, but remove the norm from the measured TP2
+    # row while leaving a tempting non-empty timing. TP1 still owns this op.
+    source = Path(__file__).resolve().parents[2] / "data/profiling/compute/h200/llama2_7b_dense_example/linear_op.csv"
+    df = pd.read_csv(source)
+    first = df[df.num_tensor_parallel_workers == 1].iloc[[0]].copy()
+    second = first.copy()
+    second["num_tensor_parallel_workers"] = 2
+    contracts = json.loads(second["typed_operator_contracts"].iloc[0])
+    del contracts["post_attention_layernorm"]
+    second["typed_operator_contracts"] = json.dumps(contracts)
+    target = "time_stats.post_attention_layernorm.median"
+    first[target], second[target] = 0.003, 99.0
+    path = tmp_path / "typed.csv"
+    pd.concat([first, second]).to_csv(path, index=False)
+    manager = _manager()
+    manager._train_single_model = lambda **kw: kw["df"][target].iloc[0]
+    replica = SimpleNamespace(device="h200", model_name="llama2_7b_dense_example",
+        model_config=Llama2_7BModelConfig(), attn_tensor_parallel_size=2)
+    assert manager._train_post_attention_layernorm_for_cluster(
+        cluster_type=ClusterType.DECODE_ATTN, replica_config=replica,
+        execution_time_predictor_config=None, linear_ops_file=str(path), trained_model_signatures=set(),
+    ) == 0.003

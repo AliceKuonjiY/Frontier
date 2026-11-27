@@ -1,4 +1,6 @@
 import csv
+import subprocess
+import sys
 
 import pytest
 
@@ -30,9 +32,40 @@ def test_failed_comparison_preserves_both_previous_tables(tmp_path, bad_side):
 def test_publish_orders_all_pairs_and_computes_changes(tmp_path):
     after = _rows()[::-1]
     after[0]["decode_tokens_per_second"] = 6
+    tmp_path = tmp_path / "published"
     publish(_rows(), after, tmp_path)
     for filename in ("after_fix_results.csv", "before_after_comparison.csv"):
         with (tmp_path / filename).open(newline="") as f:
             rows = list(csv.DictReader(f))
         assert [r["name"] for r in rows] == list(CASES)
     assert float(rows[-1]["out_tps_pct"]) == 20
+
+
+@pytest.mark.parametrize("malformation", ["short", "duplicate_header", "long"])
+def test_cli_rejects_malformed_csv_without_creating_either_output(tmp_path, malformation):
+    rows = _rows()
+    fields = list(rows[0])
+    inputs = [tmp_path / name for name in ("before.csv", "candidate.csv")]
+    for path in inputs:
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(fields + ([fields[0]] if path == inputs[1] and malformation == "duplicate_header" else []))
+            for i, row in enumerate(rows):
+                values = list(row.values())
+                if path == inputs[1] and i == len(rows) - 1:
+                    values = values[:-1] if malformation == "short" else values + [1]
+                writer.writerow(values)
+    out = tmp_path / "new"
+    result = subprocess.run([sys.executable, "-m", "tests.performance.qwen3_4b_pdaf.compare",
+                             *inputs, out], capture_output=True, text=True)
+    assert result.returncode == 1 and "Failed to publish" in result.stderr
+    assert not out.exists()
+
+
+def test_completed_batch_cannot_be_overwritten(tmp_path):
+    out = tmp_path / "batch1"
+    publish(_rows(), _rows(), out)
+    snapshot = {p.name: p.read_bytes() for p in out.iterdir()}
+    with pytest.raises(FileExistsError):
+        publish(_rows(), _rows()[::-1], out)
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == snapshot

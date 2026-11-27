@@ -577,7 +577,8 @@ class PredictionFamilyTrainers(KernelCountTraining):
         def load(tp: int) -> pd.DataFrame:
             training_context["tensor_parallel_size"] = tp
             return self._load_linear_op_df(
-                linear_ops_file, tp, required_columns=[target], training_context=training_context
+                linear_ops_file, tp, required_columns=[target], training_context=training_context,
+                replicated_operator="post_attention_layernorm" if tp_key == 1 else None,
             )
 
         try:

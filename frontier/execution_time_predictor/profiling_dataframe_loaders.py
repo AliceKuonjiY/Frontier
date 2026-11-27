@@ -64,6 +64,7 @@ class ProfilingDataFrameLoaders:
         training_context: Optional[Dict[str, Any]] = None,
         layer_contract: Optional[ResolvedLayerContract] = None,
         operator_name: Optional[str] = None,
+        replicated_operator: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Load linear operation dataframe (linear_op.csv or mlp.csv) with tensor parallel filtering.
@@ -159,6 +160,15 @@ class ProfilingDataFrameLoaders:
             pd.DataFrame,
             df[df["num_tensor_parallel_workers"] == tensor_parallel_size],
         )
+        if parsed_typed_contracts is not None and replicated_operator is not None:
+            # Row TP describes where the sample was measured. The replicated
+            # operator itself uses a TP1 contract even in a role-TP>1 row.
+            def owns_replicated_sample(contracts):
+                op = contracts.get(replicated_operator)
+                return op is not None and op["tensor_parallel_mode"] == "replicated" and op["selected_tensor_parallel_size"] == 1
+
+            mask = parsed_typed_contracts.loc[filtered_df.index].map(owns_replicated_sample)
+            filtered_df = cast(pd.DataFrame, filtered_df.loc[mask.astype(bool)])
         if parsed_typed_contracts is not None and layer_contract is not None:
             selected_layer_contract = layer_contract
             if not isinstance(operator_name, str) or not operator_name:

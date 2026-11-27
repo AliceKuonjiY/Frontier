@@ -25,6 +25,8 @@ def _index(rows, label):
             continue
         if name in by_name:
             raise ValueError(f"Duplicate {label} case: {name}")
+        if None in row or any(v is None for v in row.values()):
+            raise ValueError(f"Malformed {label} row for {name}")
         by_name[name] = row
     missing = [name for name in CASES if name not in by_name]
     if missing:
@@ -51,23 +53,41 @@ def publish(before_rows, after_rows, output_dir):
         if not math.isfinite(prefill) or prefill < 0:
             raise ValueError(f"Invalid prefill E2E for {name}: {prefill}")
         pair["after_prefill_e2e_ms"] = round(prefill, 4)
-        pair["after_prefill_util"] = after[name]["prefill_util"]
+        util = after[name]["prefill_util"]
+        if not str(util).strip():
+            raise ValueError(f"Missing prefill_util for {name}; use NA if unavailable")
+        pair["after_prefill_util"] = util
         pairs.append(pair)
 
     out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        raise FileExistsError(f"Choose a new output directory; preserving {out}")
     tables = {"after_fix_results.csv": [after[name] for name in CASES],
               "before_after_comparison.csv": pairs}
-    # Stage both in the destination filesystem. Validation/serialization failures
-    # cannot truncate an existing table; replacement is atomic per file.
-    with TemporaryDirectory(dir=out) as tmp:
+    # Publish one immutable directory, not two independent file replacements.
+    with TemporaryDirectory(dir=out.parent) as tmp:
+        stage = Path(tmp) / "batch"
+        stage.mkdir()
         for filename, rows in tables.items():
-            with (Path(tmp) / filename).open("w", encoding="utf-8", newline="") as f:
+            with (stage / filename).open("w", encoding="utf-8", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=list(rows[0]))
                 writer.writeheader()
                 writer.writerows(rows)
-        for filename in tables:
-            (Path(tmp) / filename).replace(out / filename)
+        stage.rename(out)
+
+
+def _read_csv(stream):
+    reader = csv.DictReader(stream, strict=True)
+    header = reader.fieldnames
+    if not header or not all(header) or len(set(header)) != len(header):
+        raise ValueError(f"Missing or duplicate column name in {stream.name}")
+    rows = []
+    for row in reader:
+        if None in row or any(v is None for v in row.values()):
+            raise ValueError(f"Wrong column count in {stream.name}, line {reader.line_num}")
+        rows.append(row)
+    return rows
 
 
 def main():
@@ -78,9 +98,9 @@ def main():
     args = parser.parse_args()
     try:
         with args.before.open(encoding="utf-8-sig", newline="") as b, args.after.open(encoding="utf-8-sig", newline="") as a:
-            before, after = list(csv.DictReader(b)), list(csv.DictReader(a))
+            before, after = _read_csv(b), _read_csv(a)
         publish(before, after, args.output)
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, csv.Error) as exc:
         parser.exit(1, f"Failed to publish comparison: {exc}\n")
 
 
