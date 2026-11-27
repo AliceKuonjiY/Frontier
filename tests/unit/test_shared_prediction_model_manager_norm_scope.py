@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from frontier.config.model_config import BaseModelConfig
 from frontier.execution_time_predictor.shared_prediction_model_manager import (
@@ -47,7 +48,7 @@ def test_decode_attn_trains_role_local_h200_norm_and_overrides_ffn_view(
             "time_stats.post_attention_layernorm.median": [0.001632],
         }
     )
-    manager._load_linear_op_df = lambda path, tp: (
+    manager._load_linear_op_df = lambda path, tp, **kwargs: (
         load_calls.append((path, tp)) or layernorm_df
     )
     sentinel = SimpleNamespace(name="h200-role-local-norm")
@@ -110,3 +111,28 @@ def test_decode_attn_trains_role_local_h200_norm_and_overrides_ffn_view(
 
     assert attn_view["post_attention_layernorm"] is sentinel
     assert ffn_view["post_attention_layernorm"] is hpp2_norm
+
+@pytest.mark.parametrize(("tp2", "selected_tp", "expected"), [
+    (0.001632, 2, 0.001632), (float("nan"), 1, 0.003), (None, 1, 0.003),
+])
+def test_decode_attn_prefers_measured_tp_and_falls_back_only_for_missing_samples(
+    tmp_path, tp2, selected_tp, expected,
+):
+    manager = _manager()
+    replica = SimpleNamespace(device="h200", model_name="Qwen3-4B",
+        model_config=BaseModelConfig.create_from_name("Qwen3-4B"), attn_tensor_parallel_size=2)
+    target = "time_stats.post_attention_layernorm.median"
+    rows = [{"num_tensor_parallel_workers": 1, "num_tokens": 8, "use_qk_norm": True, target: 0.003}]
+    if tp2 is not None:
+        rows.append(dict(rows[0], num_tensor_parallel_workers=2, **{target: tp2}))
+    path = tmp_path / "linear.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    manager._train_single_model = lambda **kw: (kw["training_context"]["tensor_parallel_size"], kw["df"][target].iloc[0])
+    args = dict(cluster_type=ClusterType.DECODE_ATTN, replica_config=replica,
+                execution_time_predictor_config=None, linear_ops_file=str(path), trained_model_signatures=set())
+    assert manager._train_post_attention_layernorm_for_cluster(**args) == (selected_tp, expected)
+    # Without a target column there is no legitimate fallback on any TP.
+    manager._cluster_scoped_models.clear()
+    pd.DataFrame(rows).drop(columns=target).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="Missing columns"):
+        manager._train_post_attention_layernorm_for_cluster(**args)

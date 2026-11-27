@@ -49,6 +49,10 @@ from typing import Any, Dict, List, Optional, cast
 logger = init_logger(__name__)
 
 
+class MissingLinearOpSamples(ValueError):
+    """The selected TP has no usable measurements (not a malformed schema)."""
+
+
 class ProfilingDataFrameLoaders:
     """Profiling CSV loading, validation and derived features."""
 
@@ -218,7 +222,7 @@ class ProfilingDataFrameLoaders:
                 if layer_contract is not None
                 else "legacy model width"
             )
-            raise ValueError(
+            raise MissingLinearOpSamples(
                 f"No data matches the filtering criteria in {file_path}\n"
                 f"Required tensor_parallel_size: {tensor_parallel_size}\n"
                 f"Available tensor_parallel_sizes: {available_tp}\n"
@@ -280,7 +284,8 @@ class ProfilingDataFrameLoaders:
             if training_context:
                 context_text = f"\nTraining context: {training_context}"
 
-            raise ValueError(
+            error = ValueError if missing_columns else MissingLinearOpSamples
+            raise error(
                 "Required attention linear op columns are missing or all-NaN in "
                 f"{file_path}."
                 f"\nMissing columns: {missing_columns}"
