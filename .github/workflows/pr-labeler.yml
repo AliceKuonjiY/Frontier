@@ -1,0 +1,61 @@
+name: PR Auto Labeler
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: '需要手动打标的 PR 编号'
+        required: true
+        type: string
+
+concurrency:
+  group: pr-auto-labeler-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    name: 自动为 PR 添加标签
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Resolve PR number
+        id: pr
+        env:
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          PR_NUMBER="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
+          if [[ ! "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]] || [[ "${PR_NUMBER}" == *$'\n'* ]]; then
+            echo "::error::PR 编号必须为正整数。"
+            exit 1
+          fi
+          echo "number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout labeler config and script
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: Apply PR labels
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          python3 .github/scripts/pr_labeler.py \
+            --pr-number "${PR_NUMBER}" \
+            --repo "${GITHUB_REPO}" \
+            --config .github/pr-labeler.json
