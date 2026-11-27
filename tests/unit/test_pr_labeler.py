@@ -4,6 +4,7 @@ import importlib.util
 import json
 import re
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -46,6 +47,16 @@ def test_pr_labeler_workflow_and_config_are_valid() -> None:
     }
     assert label_job["timeout-minutes"] <= 10
 
+    # Ensure workflow_dispatch input is strictly validated as positive integer
+    # and never interpolated directly into shell `run:` commands.
+    steps_by_name = {step["name"]: step for step in label_job["steps"]}
+    resolve_step = steps_by_name["Resolve PR number"]
+    assert "^[1-9][0-9]*$" in resolve_step["run"]
+    apply_step = steps_by_name["Apply PR labels"]
+    assert "${{" not in apply_step["run"]
+    assert apply_step["env"]["PR_NUMBER"] == "${{ steps.pr.outputs.number }}"
+    assert apply_step["env"]["GITHUB_REPO"] == "${{ github.repository }}"
+
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     label_meta = config["labels"]
     hex_re = re.compile(r"^[0-9a-fA-F]{6}$")
@@ -73,6 +84,8 @@ def test_glob_matching_and_paginated_json_parsing() -> None:
     assert mod.matches_any_glob("data/profiling/h200/a.csv", ["**/*.csv"])
     assert mod.matches_any_glob("frontier/moe_ep_workload.py", ["frontier/moe_*"])
     assert not mod.matches_any_glob("frontier/sub/moe_ep.py", ["frontier/moe_*"])
+    assert mod.matches_any_glob("tests/e2e/pd_af_parity/runner.py", ["**/*pd_af*/**"])
+    assert mod.matches_any_glob("tests/performance/qwen3_4b_pdaf/compare.py", ["**/*pdaf*/**"])
 
     parsed = mod.parse_paginated_json_array('[{"a": 1}]\n[{"a": 2}, {"a": 3}]')
     assert parsed == [{"a": 1}, {"a": 2}, {"a": 3}]
@@ -82,7 +95,8 @@ def test_compute_pr_labels_title_precedence_areas_and_size() -> None:
     mod = _load_labeler()
     config = mod.load_config(CONFIG_PATH)
 
-    # Title prefix `ci:` must take precedence over head branch `feat/...`.
+    # Title prefix `ci:` must take precedence over head branch `feat/...`,
+    # and hyphenated branch names in the title must not falsely trigger `area/pd-af`.
     ci_res = mod.compute_pr_labels(
         title="ci: add Codex PR review workflow for qwen3-4b-pd-af-simulator",
         head_branch="feat/codex-pr-review",
@@ -122,6 +136,21 @@ def test_compute_pr_labels_title_precedence_areas_and_size() -> None:
     assert pdaf_res["net_changes"] == 327
     assert pdaf_res["ignored_size_files"] == 1
 
+    # Files nested inside pd_af / pdaf subdirectories and RUN_QWEN3_4B_PD_AF.md
+    # must match `area/pd-af` even without title/branch keywords.
+    for path in (
+        "tests/e2e/pd_af_parity/runner.py",
+        "tests/performance/qwen3_4b_pdaf/compare.py",
+        "RUN_QWEN3_4B_PD_AF.md",
+    ):
+        sub_res = mod.compute_pr_labels(
+            title="Update runner script",
+            head_branch="update-runner",
+            files=[{"filename": path, "additions": 10, "deletions": 2}],
+            config=config,
+        )
+        assert "area/pd-af" in sub_res["labels"], f"{path} should match area/pd-af"
+
     # Test-only PR gets `tests` label even without `test:` title prefix.
     test_only = mod.compute_pr_labels(
         title="Add unit tests for overlap metrics",
@@ -132,6 +161,19 @@ def test_compute_pr_labels_title_precedence_areas_and_size() -> None:
         config=config,
     )
     assert set(test_only["labels"]) == {"tests", "size/XS"}
+
+    # Mixed changes on a `test/` branch without a `test:` title prefix must NOT get `tests`.
+    mixed_test_branch = mod.compute_pr_labels(
+        title="Adjust simulator scheduling logic",
+        head_branch="test/scheduler-experiment",
+        files=[
+            {"filename": "frontier/scheduler/foo.py", "additions": 20, "deletions": 5},
+            {"filename": "tests/unit/test_foo.py", "additions": 30, "deletions": 0},
+        ],
+        config=config,
+    )
+    assert "tests" not in mixed_test_branch["labels"]
+    assert "area/scheduler" in mixed_test_branch["labels"]
 
     # Fallback to branch prefix when title has no conventional prefix.
     branch_fallback = mod.compute_pr_labels(
@@ -154,3 +196,152 @@ def test_plan_label_updates_swaps_stale_size_and_preserves_manual_labels() -> No
     )
     assert to_add == ["area/pd-af", "bug", "size/L"]
     assert to_remove == ["size/S"]
+
+
+def test_ensure_repo_labels_exist_handles_422_already_exists_in_stdout() -> None:
+    mod = _load_labeler()
+
+    def fake_gh_api(endpoint, *, method="GET", paginate=False, fields=None, json_payload=None):
+        if method == "GET" and endpoint.startswith("repos/AliceKuonjiY/Frontier/labels"):
+            return 0, json.dumps([{"name": "bug"}]), ""
+        if method == "POST" and endpoint == "repos/AliceKuonjiY/Frontier/labels":
+            name = dict(fields or {}).get("name")
+            if name == "area/pd-af":
+                # Simulate real `gh api` 422 behavior: JSON details on stdout, summary on stderr.
+                stdout = json.dumps(
+                    {
+                        "message": "Validation Failed",
+                        "errors": [
+                            {"resource": "Label", "code": "already_exists", "field": "name"}
+                        ],
+                    }
+                )
+                return 1, stdout, "gh: Validation Failed (HTTP 422)"
+            return 0, "{}", ""
+        raise AssertionError(f"Unexpected gh api call: {method} {endpoint}")
+
+    with mock.patch.object(mod, "run_gh_api", side_effect=fake_gh_api):
+        created = mod.ensure_repo_labels_exist(
+            repo="AliceKuonjiY/Frontier",
+            labels_to_add=["bug", "area/pd-af", "size/M"],
+            label_metadata={
+                "area/pd-af": {"color": "5319e7", "description": "PD-AF"},
+                "size/M": {"color": "f0ad4e", "description": "Medium PR"},
+            },
+        )
+    assert created == ["size/M"]
+
+
+def test_apply_pr_labels_e2e_and_fork_skip_and_dry_run() -> None:
+    mod = _load_labeler()
+    calls: list[tuple[str, str, list[tuple[str, str]] | None, dict | None]] = []
+
+    def fake_same_repo_gh_api(
+        endpoint, *, method="GET", paginate=False, fields=None, json_payload=None
+    ):
+        calls.append((method, endpoint, fields, json_payload))
+        if method == "GET" and endpoint == "repos/AliceKuonjiY/Frontier/pulls/99":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "title": "feat(pd-af): test overlap",
+                        "head": {
+                            "ref": "feat/test",
+                            "repo": {"full_name": "AliceKuonjiY/Frontier"},
+                        },
+                        "labels": [{"name": "help wanted"}, {"name": "size/S"}],
+                    }
+                ),
+                "",
+            )
+        if method == "GET" and endpoint.startswith("repos/AliceKuonjiY/Frontier/pulls/99/files"):
+            page1 = json.dumps([{"filename": "frontier/metrics/a.py", "additions": 250, "deletions": 10}])
+            page2 = json.dumps([{"filename": "data/profiling/x.csv", "additions": 9000, "deletions": 0}])
+            return 0, f"{page1}\n{page2}", ""
+        if method == "GET" and endpoint.startswith("repos/AliceKuonjiY/Frontier/labels"):
+            return 0, json.dumps([{"name": "enhancement"}, {"name": "help wanted"}]), ""
+        if method == "POST" and endpoint == "repos/AliceKuonjiY/Frontier/labels":
+            name = dict(fields or {}).get("name")
+            if name == "area/metrics":
+                return (
+                    1,
+                    '{"message":"Validation Failed","errors":[{"code":"already_exists"}]}',
+                    "gh: Validation Failed (HTTP 422)",
+                )
+            return 0, "{}", ""
+        if method == "POST" and endpoint == "repos/AliceKuonjiY/Frontier/issues/99/labels":
+            return 0, "[]", ""
+        if method == "DELETE" and endpoint == "repos/AliceKuonjiY/Frontier/issues/99/labels/size%2FS":
+            # Also verify 404 on already-deleted label is tolerated gracefully.
+            return 1, '{"message":"Not Found"}', "gh: Not Found (HTTP 404)"
+        raise AssertionError(f"Unexpected call: {method} {endpoint}")
+
+    # 1. Full apply flow (including 422 race on stdout & URL-encoded DELETE 404 tolerance).
+    with mock.patch.object(mod, "run_gh_api", side_effect=fake_same_repo_gh_api):
+        summary = mod.apply_pr_labels(
+            repo="AliceKuonjiY/Frontier",
+            pr_number=99,
+            config_path=CONFIG_PATH,
+            dry_run=False,
+        )
+    assert summary["skipped_fork"] is False
+    assert set(summary["added_labels"]) == {
+        "area/metrics",
+        "area/pd-af",
+        "area/profiling",
+        "enhancement",
+        "size/M",
+    }
+    assert summary["removed_labels"] == ["size/S"]
+    delete_endpoints = [ep for m, ep, _, _ in calls if m == "DELETE"]
+    assert delete_endpoints == ["repos/AliceKuonjiY/Frontier/issues/99/labels/size%2FS"]
+    md = mod.format_step_summary(summary)
+    assert "### PR #99 Auto Labeler Summary" in md
+    assert "`size/M`" in md
+    assert "`size/S`" in md
+
+    # 2. dry_run=True performs zero mutating calls.
+    calls.clear()
+    with mock.patch.object(mod, "run_gh_api", side_effect=fake_same_repo_gh_api):
+        dry_summary = mod.apply_pr_labels(
+            repo="AliceKuonjiY/Frontier",
+            pr_number=99,
+            config_path=CONFIG_PATH,
+            dry_run=True,
+        )
+    assert dry_summary["dry_run"] is True
+    assert all(m == "GET" for m, _, _, _ in calls)
+
+    # 3. Fork PR (via workflow_dispatch) must be skipped before any write API calls.
+    fork_calls: list[tuple[str, str]] = []
+
+    def fake_fork_gh_api(endpoint, *, method="GET", paginate=False, fields=None, json_payload=None):
+        fork_calls.append((method, endpoint))
+        if method == "GET" and endpoint == "repos/AliceKuonjiY/Frontier/pulls/77":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "title": "fix(pd-af): external fork PR",
+                        "head": {
+                            "ref": "fix/external",
+                            "repo": {"full_name": "SomeoneElse/Frontier"},
+                        },
+                        "labels": [{"name": "size/S"}],
+                    }
+                ),
+                "",
+            )
+        raise AssertionError(f"Fork PR must not trigger further API calls: {method} {endpoint}")
+
+    with mock.patch.object(mod, "run_gh_api", side_effect=fake_fork_gh_api):
+        fork_summary = mod.apply_pr_labels(
+            repo="AliceKuonjiY/Frontier",
+            pr_number=77,
+            config_path=CONFIG_PATH,
+            dry_run=False,
+        )
+    assert fork_summary["skipped_fork"] is True
+    assert fork_calls == [("GET", "repos/AliceKuonjiY/Frontier/pulls/77")]
+    assert "Skipped" in mod.format_step_summary(fork_summary)

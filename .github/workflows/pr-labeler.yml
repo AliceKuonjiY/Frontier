@@ -35,8 +35,8 @@ jobs:
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           PR_NUMBER="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
-          if [ -z "${PR_NUMBER}" ]; then
-            echo "::error::无法解析 PR 编号。"
+          if [[ ! "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]] || [[ "${PR_NUMBER}" == *$'\n'* ]]; then
+            echo "::error::PR 编号必须为正整数。"
             exit 1
           fi
           echo "number=${PR_NUMBER}" >> "${GITHUB_OUTPUT}"
@@ -52,8 +52,10 @@ jobs:
       - name: Apply PR labels
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          GITHUB_REPO: ${{ github.repository }}
         run: |
           python3 .github/scripts/pr_labeler.py \
-            --pr-number "${{ steps.pr.outputs.number }}" \
-            --repo "${{ github.repository }}" \
+            --pr-number "${PR_NUMBER}" \
+            --repo "${GITHUB_REPO}" \
             --config .github/pr-labeler.json

@@ -139,12 +139,17 @@
       "any_paths": [
         "frontier/m2n_transfer/**",
         "examples/architecture/pd-af-disagg/**",
+        "RUN_QWEN3_4B_PD_AF.md",
         "**/*pd_af*",
+        "**/*pd_af*/**",
         "**/*pdaf*",
+        "**/*pdaf*/**",
         "**/*af_overlap*",
         "**/*afd_*",
         "**/*_afd*",
-        "**/*hpp2*"
+        "**/*afd*/**",
+        "**/*hpp2*",
+        "**/*hpp2*/**"
       ],
       "title_patterns": [
         "(?<![a-zA-Z0-9_-])pd[-_ ]?af(?![a-zA-Z0-9_-])",
@@ -186,7 +191,8 @@
     "area/moe": {
       "any_paths": [
         "frontier/moe_*",
-        "**/*moe*"
+        "**/*moe*",
+        "**/*moe*/**"
       ],
       "title_patterns": [
         "(?<![a-zA-Z0-9_-])moe(?![a-zA-Z0-9_-])"

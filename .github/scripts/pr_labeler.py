@@ -155,8 +155,10 @@ def compute_pr_labels(
         branch_match = BRANCH_PREFIX_RE.match(head_branch or "")
         if branch_match:
             prefix = branch_match.group("prefix").lower()
-            if prefix in type_prefixes:
-                add_label(type_prefixes[prefix], f"branch prefix `{prefix}/`")
+            branch_label = type_prefixes.get(prefix)
+            # Only explicit `test:` title prefixes or test-only diffs should emit `tests`.
+            if branch_label and branch_label != "tests":
+                add_label(branch_label, f"branch prefix `{prefix}/`")
 
     # 2. Path-based type rules.
     for label, rule in config.get("path_rules", {}).items():
@@ -281,7 +283,7 @@ def ensure_repo_labels_exist(
         meta = label_metadata.get(label, {})
         color = str(meta.get("color", "ededed")).lstrip("#")
         description = str(meta.get("description", ""))[:100]
-        rc, _, err = run_gh_api(
+        rc, out, err = run_gh_api(
             f"repos/{repo}/labels",
             method="POST",
             fields=[
@@ -290,12 +292,16 @@ def ensure_repo_labels_exist(
                 ("description", description),
             ],
         )
+        combined = f"{out}\n{err}"
         if rc == 0:
             created.append(label)
             existing_lower.add(label.lower())
-        elif "already_exists" not in err.lower():
+        elif "already_exists" in combined.lower():
+            existing_lower.add(label.lower())
+        else:
+            detail = err.strip() or out.strip()
             raise RuntimeError(
-                f"Failed to create repository label '{label}': {err.strip()}"
+                f"Failed to create repository label '{label}': {detail}"
             )
     return created
 
@@ -314,6 +320,31 @@ def apply_pr_labels(
         raise RuntimeError(f"Failed to fetch PR #{pr_number}: {pr_stderr.strip()}")
     pr_data = json.loads(pr_stdout)
 
+    title = str(pr_data.get("title") or "")
+    head_info = pr_data.get("head") if isinstance(pr_data.get("head"), dict) else {}
+    head_branch = str(head_info.get("ref") or "")
+    head_repo = head_info.get("repo") if isinstance(head_info.get("repo"), dict) else {}
+    head_repo_full_name = str(head_repo.get("full_name") or "")
+
+    if head_repo_full_name.lower() != repo.lower():
+        return {
+            "pr_number": pr_number,
+            "title": title,
+            "head_branch": head_branch,
+            "head_repo": head_repo_full_name,
+            "skipped_fork": True,
+            "desired_labels": [],
+            "reasons": {},
+            "existing_labels": [],
+            "added_labels": [],
+            "removed_labels": [],
+            "created_repo_labels": [],
+            "net_changes": 0,
+            "total_files": 0,
+            "ignored_size_files": 0,
+            "dry_run": dry_run,
+        }
+
     rc, files_stdout, files_stderr = run_gh_api(
         f"repos/{repo}/pulls/{pr_number}/files?per_page=100",
         paginate=True,
@@ -324,8 +355,6 @@ def apply_pr_labels(
         )
     files = parse_paginated_json_array(files_stdout)
 
-    title = str(pr_data.get("title") or "")
-    head_branch = str((pr_data.get("head") or {}).get("ref") or "")
     existing_pr_labels = [
         str(lbl["name"])
         for lbl in pr_data.get("labels", [])
@@ -352,30 +381,35 @@ def apply_pr_labels(
             label_metadata=config.get("labels", {}),
         )
         if to_add:
-            rc, _, err = run_gh_api(
+            rc, out, err = run_gh_api(
                 f"repos/{repo}/issues/{pr_number}/labels",
                 method="POST",
                 json_payload={"labels": to_add},
             )
             if rc != 0:
+                detail = err.strip() or out.strip()
                 raise RuntimeError(
-                    f"Failed to add labels {to_add} to PR #{pr_number}: {err.strip()}"
+                    f"Failed to add labels {to_add} to PR #{pr_number}: {detail}"
                 )
         for stale in to_remove:
             encoded = urllib.parse.quote(stale, safe="")
-            rc, _, err = run_gh_api(
+            rc, out, err = run_gh_api(
                 f"repos/{repo}/issues/{pr_number}/labels/{encoded}",
                 method="DELETE",
             )
-            if rc != 0 and "404" not in err:
+            combined = f"{out}\n{err}"
+            if rc != 0 and "404" not in combined:
+                detail = err.strip() or out.strip()
                 raise RuntimeError(
-                    f"Failed to remove stale label '{stale}' from PR #{pr_number}: {err.strip()}"
+                    f"Failed to remove stale label '{stale}' from PR #{pr_number}: {detail}"
                 )
 
     summary_data = {
         "pr_number": pr_number,
         "title": title,
         "head_branch": head_branch,
+        "head_repo": head_repo_full_name,
+        "skipped_fork": False,
         "desired_labels": result["labels"],
         "reasons": result["reasons"],
         "existing_labels": sorted(existing_pr_labels),
@@ -391,6 +425,13 @@ def apply_pr_labels(
 
 
 def format_step_summary(data: dict[str, Any]) -> str:
+    if data.get("skipped_fork"):
+        head_repo = data.get("head_repo") or "(deleted/unknown)"
+        return (
+            f"### PR #{data['pr_number']} Auto Labeler Summary\n\n"
+            f"- **Skipped**: head repository `{head_repo}` does not match target repository (fork PR).\n"
+        )
+
     lines = [
         f"### PR #{data['pr_number']} Auto Labeler Summary",
         "",
