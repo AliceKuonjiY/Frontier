@@ -115,7 +115,7 @@ def test_decode_attn_trains_role_local_h200_norm_and_overrides_ffn_view(
     assert ffn_view["post_attention_layernorm"] is hpp2_norm
 
 @pytest.mark.parametrize(("tp2", "selected_tp", "expected"), [
-    (0.001632, 2, 0.001632), (float("nan"), 1, 0.003), (None, 1, 0.003),
+    (0.001632, 2, 0.001632), (float("nan"), 1, 0.003), (None, 1, 0.003), ("unpaired", 1, 0.003),
 ])
 def test_decode_attn_prefers_measured_tp_and_falls_back_only_for_missing_samples(
     tmp_path, tp2, selected_tp, expected,
@@ -125,7 +125,10 @@ def test_decode_attn_prefers_measured_tp_and_falls_back_only_for_missing_samples
         model_config=BaseModelConfig.create_from_name("Qwen3-4B"), attn_tensor_parallel_size=2)
     target = "time_stats.post_attention_layernorm.median"
     rows = [{"num_tensor_parallel_workers": 1, "num_tokens": 8, "use_qk_norm": True, target: 0.003}]
-    if tp2 is not None:
+    if tp2 == "unpaired":
+        rows.extend([dict(rows[0], num_tensor_parallel_workers=2, num_tokens=float("nan")),
+                     dict(rows[0], num_tensor_parallel_workers=2, **{target: float("nan")})])
+    elif tp2 is not None:
         rows.append(dict(rows[0], num_tensor_parallel_workers=2, **{target: tp2}))
     path = tmp_path / "linear.csv"
     pd.DataFrame(rows).to_csv(path, index=False)

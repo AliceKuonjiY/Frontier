@@ -4,12 +4,12 @@ import sys
 
 import pytest
 
-from tests.performance.qwen3_4b_pdaf.compare import CASES, expected_requests, publish
+from tests.performance.qwen3_4b_pdaf.compare import CASES, expected_parameters, expected_requests, publish
 
 
 def _rows():
     return [dict(name=name, total_requests=expected_requests(name), completed_requests=expected_requests(name), ttft_mean_ms=3, tpot_mean_ms=2, decode_tokens_per_second=5,
-                 prefill_e2e_mean_ms=3, prefill_util="NA") for name in CASES]
+                 prefill_e2e_mean_ms=3, prefill_util="NA", **expected_parameters(name)) for name in CASES]
 
 
 @pytest.mark.parametrize("bad_side", ["before", "after", "duplicate", "invalid"])
@@ -24,7 +24,7 @@ def test_failed_comparison_preserves_both_previous_tables(tmp_path, bad_side):
         after[-1]["tpot_mean_ms"] = float("nan")
     else:
         (before if bad_side == "before" else after).pop()
-    with pytest.raises(ValueError, match=CASES[-1]):
+    with pytest.raises(ValueError, match=list(CASES)[-1]):
         publish(before, after, tmp_path)
     assert all(file.read_bytes() == b"last complete run" for file in files)
 
@@ -79,3 +79,13 @@ def test_rejects_time_limited_poisson_run_even_with_valid_timings(tmp_path, side
     with pytest.raises(ValueError, match="completed_requests=200"):
         publish(before, after, out)
     assert not out.exists()
+
+
+@pytest.mark.parametrize(("field", "value"), [("af_mb", 2), ("seed", 0), ("arrival_pattern", "burst"),
+                                               ("prefill_util", "nan"), ("prefill_util", "inf"), ("prefill_util", "text")])
+def test_rejects_invalid_case_parameters_and_utilization(tmp_path, field, value):
+    after = _rows()
+    after[-1][field] = value
+    with pytest.raises(ValueError):
+        publish(_rows(), after, tmp_path / "batch")
+    assert not (tmp_path / "batch").exists()

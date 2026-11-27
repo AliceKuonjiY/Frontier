@@ -10,17 +10,42 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 
-CASES = (
-    "verify_baseline_stream0", "verify_baseline_stream3", "g16_p8_d8_tp2",
-    "g16_p8_d8_tp2_af4", "g12_p4_d8_tp2", "g8_p4_d4_tp1", "g8_p4_d4_tp2",
-    "ws3_g16_p8d8_af4_f1", "ws3_g16_p8d8_af4_f2", "pois_g16_tp2_af4_qps250_n400",
-)
+# Prefill replicas, decode-attention replicas, H200 TP, FFN replicas, AF depth, streamed layers.
+CASES = {
+    "verify_baseline_stream0": (1, 1, 8, 1, 1, 0), "verify_baseline_stream3": (1, 1, 8, 1, 1, 3),
+    "g16_p8_d8_tp2": (4, 4, 2, 1, 1, 0), "g16_p8_d8_tp2_af4": (4, 4, 2, 1, 4, 0),
+    "g12_p4_d8_tp2": (2, 4, 2, 1, 1, 0), "g8_p4_d4_tp1": (4, 4, 1, 1, 1, 0),
+    "g8_p4_d4_tp2": (2, 2, 2, 1, 1, 0), "ws3_g16_p8d8_af4_f1": (4, 4, 2, 1, 4, 3),
+    "ws3_g16_p8d8_af4_f2": (4, 4, 2, 2, 4, 3), "pois_g16_tp2_af4_qps250_n400": (4, 4, 2, 1, 4, 0),
+}
 
 
 def expected_requests(name):
     if name.startswith("verify_baseline_"):
         return 8
     return 400 if name == "pois_g16_tp2_af4_qps250_n400" else 32
+
+
+def expected_parameters(name):
+    p, d, tp, f, af, stream = CASES[name]
+    poisson = name.startswith("pois_")
+    return dict(p_rep=p, d_rep=d, p_tp=tp, d_tp=tp, f_tp=16, f_rep=f, af_mb=af,
+                weight_stream_layers=stream, arrival_pattern="poisson" if poisson else "burst",
+                qps=250 if poisson else 0, seed=42, prefill_tokens=512, decode_tokens=64, d_batch=8)
+
+
+def parameters_from_config(cfg):
+    c, g = cfg["cluster_config"], cfg["request_generator_config"]
+    interval, lengths = g["interval_generator_config"], g["length_generator_config"]
+    return dict(p_rep=c["prefill_cluster_num_replicas"], d_rep=c["decode_attn_cluster_num_replicas"],
+                p_tp=c["prefill_replica_config"]["attn_tensor_parallel_size"],
+                d_tp=c["decode_attn_replica_config"]["attn_tensor_parallel_size"],
+                f_rep=c["decode_ffn_cluster_num_replicas"], f_tp=c["decode_ffn_replica_config"]["moe_tensor_parallel_size"],
+                af_mb=c["decode_attn_af_pipeline_num_micro_batch"], d_batch=c["decode_attn_micro_batch_size"],
+                weight_stream_layers=c["decode_ffn_replica_config"]["streamed_ffn_layers"],
+                prefill_tokens=lengths["prefill_tokens"], decode_tokens=lengths["decode_tokens"],
+                arrival_pattern="burst" if interval["name"]=="static" else interval["name"],
+                qps=interval.get("qps", 0), seed=interval["seed"])
 
 
 def _index(rows, label):
@@ -37,6 +62,10 @@ def _index(rows, label):
             if str(row.get(field)) != str(expected_requests(name)):
                 raise ValueError(f"Incomplete {label} case {name}: {field}={row.get(field)!r}, "
                                  f"expected {expected_requests(name)}")
+        for field, expected in expected_parameters(name).items():
+            value = row.get(field)
+            if value is None or (value != expected if isinstance(expected, str) else float(value) != expected):
+                raise ValueError(f"Mismatched {label} case {name}: {field}={value!r}, expected {expected!r}")
         by_name[name] = row
     missing = [name for name in CASES if name not in by_name]
     if missing:
@@ -64,8 +93,8 @@ def publish(before_rows, after_rows, output_dir):
             raise ValueError(f"Invalid prefill E2E for {name}: {prefill}")
         pair["after_prefill_e2e_ms"] = round(prefill, 4)
         util = after[name]["prefill_util"]
-        if not str(util).strip():
-            raise ValueError(f"Missing prefill_util for {name}; use NA if unavailable")
+        if util != "NA" and not 0 <= float(util) <= 1:
+            raise ValueError(f"Invalid prefill_util for {name}: expected NA or a fraction in [0, 1]")
         pair["after_prefill_util"] = util
         pairs.append(pair)
 

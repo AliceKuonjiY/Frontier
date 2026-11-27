@@ -576,10 +576,15 @@ class PredictionFamilyTrainers(KernelCountTraining):
 
         def load(tp: int) -> pd.DataFrame:
             training_context["tensor_parallel_size"] = tp
-            return self._load_linear_op_df(
-                linear_ops_file, tp, required_columns=[target], training_context=training_context,
+            rows = self._load_linear_op_df(
+                linear_ops_file, tp, required_columns=["num_tokens", target], training_context=training_context,
                 replicated_operator="post_attention_layernorm" if tp_key == 1 else None,
             )
+            # Fitting drops rows with a missing feature OR target. Check their
+            # intersection, not just whether each column has a value somewhere.
+            if not rows[["num_tokens", target]].notna().all(axis=1).any():
+                raise MissingLinearOpSamples(f"{linear_ops_file}: no paired norm samples at TP={tp}")
+            return rows
 
         try:
             layernorm_df = load(preferred_tp)
