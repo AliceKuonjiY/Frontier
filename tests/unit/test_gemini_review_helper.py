@@ -72,12 +72,17 @@ def test_workflow_yaml_and_embedded_settings_are_valid() -> None:
         if str(step.get("uses", "")).startswith("google-github-actions/run-gemini-cli@")
     ]
     assert len(gemini_steps) == 1
+    assert gemini_steps[0]["with"]["gemini_model"] == "${{ vars.GEMINI_MODEL || 'gemini-4-neon' }}"
     settings = json.loads(gemini_steps[0]["with"]["settings"])
     assert settings["model"]["maxSessionTurns"] == -1
     assert 0 < settings["model"]["compressionThreshold"] <= 0.3
     assert settings["model"]["summarizeToolOutput"]["run_shell_command"]["tokenBudget"] <= 4000
     overrides = settings["modelConfigs"]["customOverrides"]
     assert len(overrides) >= 1
+    assert any(
+        o["match"]["model"] == "${{ vars.GEMINI_MODEL || 'gemini-4-neon' }}"
+        for o in overrides
+    )
     assert all(
         "MEDIUM" in o["modelConfig"]["generateContentConfig"]["thinkingConfig"]["thinkingLevel"]
         for o in overrides

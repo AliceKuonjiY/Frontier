@@ -1,0 +1,280 @@
+{
+  "labels": {
+    "bug": {
+      "color": "d73a4a",
+      "description": "Something isn't working"
+    },
+    "enhancement": {
+      "color": "a2eeef",
+      "description": "New feature or request"
+    },
+    "documentation": {
+      "color": "0075ca",
+      "description": "Improvements or additions to documentation"
+    },
+    "performance": {
+      "color": "f9d0c4",
+      "description": "Performance optimization or latency improvement"
+    },
+    "refactor": {
+      "color": "c5def5",
+      "description": "Code refactoring without changing external behavior"
+    },
+    "ci": {
+      "color": "ededed",
+      "description": "GitHub Actions workflows, CI scripts, or automation"
+    },
+    "tests": {
+      "color": "bfdadc",
+      "description": "Test suite additions or test-only changes"
+    },
+    "chore": {
+      "color": "d4c5f9",
+      "description": "Maintenance, tooling, or housekeeping changes"
+    },
+    "area/pd-af": {
+      "color": "5319e7",
+      "description": "PD-AF disaggregation (PREFILL / DECODE_ATTN / DECODE_FFN)"
+    },
+    "area/pdd": {
+      "color": "7057ff",
+      "description": "PDD disaggregation (PREFILL / DECODE)"
+    },
+    "area/co-location": {
+      "color": "1d76db",
+      "description": "Co-location monolithic serving architecture"
+    },
+    "area/moe": {
+      "color": "b60205",
+      "description": "Mixture-of-Experts (MoE) routing, EP, and imbalance"
+    },
+    "area/scheduler": {
+      "color": "0e8a16",
+      "description": "Global, cluster, replica, or stage schedulers"
+    },
+    "area/predictor": {
+      "color": "fbca04",
+      "description": "Execution time predictors, trainers, and operator models"
+    },
+    "area/profiling": {
+      "color": "e99695",
+      "description": "GPU profiling scripts and profiling datasets"
+    },
+    "area/cc-backend": {
+      "color": "006b75",
+      "description": "Communication cost backends (analytical / collective-sim)"
+    },
+    "area/spec-decode": {
+      "color": "c2e0c6",
+      "description": "Speculative decoding / MTP modeling"
+    },
+    "area/metrics": {
+      "color": "bfd4f2",
+      "description": "Metrics collection, trackers, and reporting"
+    },
+    "area/config": {
+      "color": "fef2c0",
+      "description": "Configuration dataclasses and CLI arguments"
+    },
+    "size/XS": {
+      "color": "009900",
+      "description": "Very small PR (< 50 changed lines)"
+    },
+    "size/S": {
+      "color": "5cb85c",
+      "description": "Small PR (50-199 changed lines)"
+    },
+    "size/M": {
+      "color": "f0ad4e",
+      "description": "Medium PR (200-599 changed lines)"
+    },
+    "size/L": {
+      "color": "d9534f",
+      "description": "Large PR (600-1499 changed lines)"
+    },
+    "size/XL": {
+      "color": "b60205",
+      "description": "Extra-large PR (>= 1500 changed lines)"
+    }
+  },
+  "type_prefixes": {
+    "fix": "bug",
+    "bugfix": "bug",
+    "hotfix": "bug",
+    "feat": "enhancement",
+    "feature": "enhancement",
+    "perf": "performance",
+    "refactor": "refactor",
+    "docs": "documentation",
+    "doc": "documentation",
+    "ci": "ci",
+    "test": "tests",
+    "tests": "tests",
+    "chore": "chore",
+    "build": "chore"
+  },
+  "path_rules": {
+    "ci": {
+      "any_paths": [
+        ".github/**",
+        ".gemini/**"
+      ]
+    },
+    "documentation": {
+      "any_paths": [
+        "docs/**",
+        "README.md",
+        "AGENTS.md",
+        "*.md"
+      ]
+    },
+    "tests": {
+      "all_paths": [
+        "tests/**"
+      ]
+    }
+  },
+  "area_rules": {
+    "area/pd-af": {
+      "any_paths": [
+        "frontier/m2n_transfer/**",
+        "examples/architecture/pd-af-disagg/**",
+        "**/*pd_af*",
+        "**/*pdaf*",
+        "**/*af_overlap*",
+        "**/*afd_*",
+        "**/*_afd*",
+        "**/*hpp2*"
+      ],
+      "title_patterns": [
+        "(?<![a-zA-Z0-9_-])pd[-_ ]?af(?![a-zA-Z0-9_-])",
+        "(?<![a-zA-Z0-9_-])pdaf(?![a-zA-Z0-9_-])",
+        "(?<![a-zA-Z0-9_-])afd(?![a-zA-Z0-9_-])",
+        "(?<![a-zA-Z0-9_-])hpp2(?![a-zA-Z0-9_-])"
+      ],
+      "branch_patterns": [
+        "pd[-_]?af",
+        "pdaf",
+        "hpp2"
+      ]
+    },
+    "area/pdd": {
+      "any_paths": [
+        "frontier/kv_cache_transfer/**",
+        "examples/architecture/pdd/**"
+      ],
+      "title_patterns": [
+        "(?<![a-zA-Z0-9_-])pdd(?![a-zA-Z0-9_-])",
+        "(?<![a-zA-Z0-9_-])pd[-_ ]?disagg(?:regation)?(?![a-zA-Z0-9_-])"
+      ],
+      "branch_patterns": [
+        "(?:^|[-_/])pdd(?:$|[-_/])",
+        "pd[-_]?disagg"
+      ]
+    },
+    "area/co-location": {
+      "any_paths": [
+        "examples/architecture/co-location/**"
+      ],
+      "title_patterns": [
+        "(?<![a-zA-Z0-9_-])co[-_ ]?location(?![a-zA-Z0-9_-])"
+      ],
+      "branch_patterns": [
+        "co[-_]?location"
+      ]
+    },
+    "area/moe": {
+      "any_paths": [
+        "frontier/moe_*",
+        "**/*moe*"
+      ],
+      "title_patterns": [
+        "(?<![a-zA-Z0-9_-])moe(?![a-zA-Z0-9_-])"
+      ],
+      "branch_patterns": [
+        "(?:^|[-_/])moe(?:$|[-_/])"
+      ]
+    },
+    "area/scheduler": {
+      "any_paths": [
+        "frontier/scheduler/**"
+      ]
+    },
+    "area/predictor": {
+      "any_paths": [
+        "frontier/execution_time_predictor/**",
+        "frontier/training/**",
+        "frontier/operators/**"
+      ]
+    },
+    "area/profiling": {
+      "any_paths": [
+        "frontier/profiling/**",
+        "data/profiling/**",
+        "examples/profiling/**"
+      ]
+    },
+    "area/cc-backend": {
+      "any_paths": [
+        "frontier/cc_backend/**"
+      ]
+    },
+    "area/spec-decode": {
+      "any_paths": [
+        "frontier/spec_decode/**"
+      ]
+    },
+    "area/metrics": {
+      "any_paths": [
+        "frontier/metrics/**"
+      ]
+    },
+    "area/config": {
+      "any_paths": [
+        "frontier/config/**"
+      ]
+    }
+  },
+  "size_rules": {
+    "ignore_paths": [
+      "data/profiling/**",
+      "figs/**",
+      "cache/**",
+      "outputs/**",
+      "frontier/cc_backend/backends/collective-sim/**",
+      "**/*.csv",
+      "**/*.png",
+      "**/*.jpg",
+      "**/*.jpeg",
+      "**/*.gif",
+      "**/*.pdf",
+      "**/*.pkl",
+      "**/*.zip",
+      "**/*.tar",
+      "**/*.gz",
+      "**/*.lock"
+    ],
+    "thresholds": [
+      {
+        "label": "size/XS",
+        "max_changes": 49
+      },
+      {
+        "label": "size/S",
+        "max_changes": 199
+      },
+      {
+        "label": "size/M",
+        "max_changes": 599
+      },
+      {
+        "label": "size/L",
+        "max_changes": 1499
+      },
+      {
+        "label": "size/XL",
+        "max_changes": null
+      }
+    ]
+  }
+}

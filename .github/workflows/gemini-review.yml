@@ -102,7 +102,7 @@ jobs:
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
-          gemini_model: ${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}
+          gemini_model: ${{ vars.GEMINI_MODEL || 'gemini-4-neon' }}
           settings: |-
             {
               "model": {
@@ -130,7 +130,7 @@ jobs:
                   },
                   {
                     "match": {
-                      "model": "${{ vars.GEMINI_MODEL || 'gemini-4-hydrogen' }}"
+                      "model": "${{ vars.GEMINI_MODEL || 'gemini-4-neon' }}"
                     },
                     "modelConfig": {
                       "generateContentConfig": {
