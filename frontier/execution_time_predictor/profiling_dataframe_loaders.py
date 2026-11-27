@@ -37,6 +37,7 @@ from frontier.moe_load_imbalance import MOE_LOAD_IMBALANCE_FEATURES
 from frontier.operators.typed_contracts import (
     TYPED_OPERATOR_CONTRACTS_COLUMN,
     validate_typed_operator_contracts,
+    validate_typed_operator_metadata,
 )
 from frontier.profiling.cpu_overhead.validation import (
     apply_cpu_overhead_schema_v2_defaults,
@@ -165,7 +166,21 @@ class ProfilingDataFrameLoaders:
             # operator itself uses a TP1 contract even in a role-TP>1 row.
             def owns_replicated_sample(contracts):
                 op = contracts.get(replicated_operator)
-                return op is not None and op["tensor_parallel_mode"] == "replicated" and op["selected_tensor_parallel_size"] == 1
+                if op is None:
+                    return False
+                try:
+                    validate_typed_operator_metadata(
+                        op, operator_name=replicated_operator,
+                        expected_metadata={
+                            "profile_id": training_context["model_architecture_profile"],
+                            "tensor_parallel_mode": "replicated", "selected_tensor_parallel_size": 1,
+                            "expert_parallel_mode": "off", "layer_kind": None,
+                        },
+                        expected_tensor_parallel_sizes=(1,),
+                    )
+                except ValueError as exc:
+                    raise ValueError(f"{file_path} (measurement TP={tensor_parallel_size}): {exc}") from exc
+                return True
 
             mask = parsed_typed_contracts.loc[filtered_df.index].map(owns_replicated_sample)
             filtered_df = cast(pd.DataFrame, filtered_df.loc[mask.astype(bool)])

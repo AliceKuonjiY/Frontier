@@ -4,11 +4,11 @@ import sys
 
 import pytest
 
-from tests.performance.qwen3_4b_pdaf.compare import CASES, publish
+from tests.performance.qwen3_4b_pdaf.compare import CASES, expected_requests, publish
 
 
 def _rows():
-    return [dict(name=name, ttft_mean_ms=3, tpot_mean_ms=2, decode_tokens_per_second=5,
+    return [dict(name=name, total_requests=expected_requests(name), completed_requests=expected_requests(name), ttft_mean_ms=3, tpot_mean_ms=2, decode_tokens_per_second=5,
                  prefill_e2e_mean_ms=3, prefill_util="NA") for name in CASES]
 
 
@@ -69,3 +69,13 @@ def test_completed_batch_cannot_be_overwritten(tmp_path):
     with pytest.raises(FileExistsError):
         publish(_rows(), _rows()[::-1], out)
     assert {p.name: p.read_bytes() for p in out.iterdir()} == snapshot
+
+
+@pytest.mark.parametrize("side", ["before", "after"])
+def test_rejects_time_limited_poisson_run_even_with_valid_timings(tmp_path, side):
+    before, after = _rows(), _rows()
+    (before if side == "before" else after)[-1]["completed_requests"] = 200
+    out = tmp_path / "batch"
+    with pytest.raises(ValueError, match="completed_requests=200"):
+        publish(before, after, out)
+    assert not out.exists()

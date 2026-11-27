@@ -17,6 +17,12 @@ CASES = (
 )
 
 
+def expected_requests(name):
+    if name.startswith("verify_baseline_"):
+        return 8
+    return 400 if name == "pois_g16_tp2_af4_qps250_n400" else 32
+
+
 def _index(rows, label):
     by_name = {}
     for row in rows:
@@ -27,6 +33,10 @@ def _index(rows, label):
             raise ValueError(f"Duplicate {label} case: {name}")
         if None in row or any(v is None for v in row.values()):
             raise ValueError(f"Malformed {label} row for {name}")
+        for field in ("total_requests", "completed_requests"):
+            if str(row.get(field)) != str(expected_requests(name)):
+                raise ValueError(f"Incomplete {label} case {name}: {field}={row.get(field)!r}, "
+                                 f"expected {expected_requests(name)}")
         by_name[name] = row
     missing = [name for name in CASES if name not in by_name]
     if missing:

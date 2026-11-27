@@ -16,6 +16,7 @@ python -m tests.performance.qwen3_4b_pdaf.compare before.csv candidate.csv resul
 ```
 
 Both inputs need `name`, `ttft_mean_ms`, `tpot_mean_ms`, `decode_tokens_per_second`.
+Supply `total_requests` and `completed_requests` from each run’s `system_metrics.json` on both sides, not the configured count.
 The candidate also needs `prefill_e2e_mean_ms` and `prefill_util` (`NA` if absent).
 The historical 105-case sweep alone is not a complete baseline: append the
 separate **400**-request Poisson row, not the 64-request run. A larger input is

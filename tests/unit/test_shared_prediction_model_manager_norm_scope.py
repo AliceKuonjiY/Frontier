@@ -149,7 +149,7 @@ def test_typed_tp_row_cannot_supply_another_operators_norm_sample(tmp_path):
     second = first.copy()
     second["num_tensor_parallel_workers"] = 2
     contracts = json.loads(second["typed_operator_contracts"].iloc[0])
-    del contracts["post_attention_layernorm"]
+    norm_contract = contracts.pop("post_attention_layernorm")
     second["typed_operator_contracts"] = json.dumps(contracts)
     target = "time_stats.post_attention_layernorm.median"
     first[target], second[target] = 0.003, 99.0
@@ -163,3 +163,15 @@ def test_typed_tp_row_cannot_supply_another_operators_norm_sample(tmp_path):
         cluster_type=ClusterType.DECODE_ATTN, replica_config=replica,
         execution_time_predictor_config=None, linear_ops_file=str(path), trained_model_signatures=set(),
     ) == 0.003
+
+    # A declaration that conflicts with the active profile is malformed, not
+    # an excuse to fall back to the valid TP1 row.
+    contracts["post_attention_layernorm"] = dict(norm_contract, profile_id="wrong_profile")
+    second["typed_operator_contracts"] = json.dumps(contracts)
+    pd.concat([first, second]).to_csv(path, index=False)
+    manager._cluster_scoped_models.clear()
+    with pytest.raises(ValueError, match="measurement TP=2.*profile_id"):
+        manager._train_post_attention_layernorm_for_cluster(
+            cluster_type=ClusterType.DECODE_ATTN, replica_config=replica,
+            execution_time_predictor_config=None, linear_ops_file=str(path), trained_model_signatures=set(),
+        )
