@@ -14,11 +14,14 @@
 | --output-dir PATH           | outputs/runs/<时间戳>_<commit> | 指定输出目录                  | 相对路径按 outputs/runs 解析；复用同一目录即断点续跑 |
 | --workers N                 | 3                      | 并行仿真进程数                | 8 GB 内存建议不超过 3                            |
 | --training-threads N        | 1                      | 每个仿真 GridSearchCV 的 n_jobs | 冷缓存首跑建议 1；不要与 workers 一起放大         |
-| --timeout N                 | 3600                   | 单次仿真超时秒数              | 400 请求长跑可设 7200                            |
+| --timeout N                 | 7200                   | 单次仿真超时秒数              | 0 表示不限制；冷缓存首跑建议加大                  |
 | --force                     | 关闭                   | 强制重跑选中配置              | 保留其他 stage 的结果；详见第 5 节               |
 | --list                      | -                      | 只列出选中的配置              | 不跑仿真                                         |
 | --dry-run                   | -                      | 预检并打印配置和第一条命令    | 不创建输出目录、不跑仿真                         |
 | -h/--help                   | -                      | 帮助                          |                                                  |
+
+> 冷缓存首跑会在进程内训练预测器，可能超过单次超时。用同一 `--output-dir`
+> 重跑会复用 `predictor_cache/`；必要时使用 `--timeout 0`（不限制）。
 
 ## 1. 最快用法
 

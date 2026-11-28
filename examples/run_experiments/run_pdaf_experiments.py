@@ -88,7 +88,7 @@ REPO_ROOT = HERE.parents[1]
 RUNS_ROOT = REPO_ROOT / "outputs" / "runs"
 DEFAULT_WORKERS = 3
 DEFAULT_TRAINING_THREADS = 1
-DEFAULT_TIMEOUT_S = 3600
+DEFAULT_TIMEOUT_S = 7200
 NO_GIT_SESSION_ID = uuid.uuid4().hex
 
 # main() 会根据 --output-dir 重新绑定这些全局变量；模块级默认值只为
@@ -1348,11 +1348,15 @@ def run_one(
             return exp.name, None, "cancelled", round(time.time() - t0, 1)
         try:
             try:
-                rc = proc.wait(timeout=timeout_s)
+                rc = proc.wait(timeout=None if timeout_s <= 0 else timeout_s)
             except subprocess.TimeoutExpired:
                 _terminate_proc(proc)
                 rc = -1
-                logf.write(f"\n[TIMEOUT] exceeded {timeout_s}s\n")
+                logf.write(
+                    f"\n[TIMEOUT] exceeded {timeout_s}s. "
+                    "Cold predictor training may need a larger --timeout; "
+                    "re-run the same output directory to reuse the cache.\n"
+                )
         finally:
             with _RUNNING_LOCK:
                 _RUNNING_PROCS.discard(proc)
@@ -2309,7 +2313,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"并行 worker 数（默认 {DEFAULT_WORKERS}；内存 <8GB 建议不超过 3）")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S,
-                        help=f"单次仿真超时秒数（默认 {DEFAULT_TIMEOUT_S}）")
+                        help=f"单次仿真超时秒数（默认 {DEFAULT_TIMEOUT_S}；0 表示不限制）")
     parser.add_argument("--training-threads", type=int, default=DEFAULT_TRAINING_THREADS,
                         help=f"每个仿真 sklearn GridSearchCV 的 n_jobs（默认 {DEFAULT_TRAINING_THREADS}）")
     parser.add_argument("--include-experimental", action="store_true",
