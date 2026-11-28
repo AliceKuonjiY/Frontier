@@ -180,11 +180,19 @@ class DeviceMemoryBudget:
         return self.resident_plus_buffer_bytes + self.total_overhead_bytes
 
     @property
+    def usable_headroom_bytes(self) -> int:
+        return self.usable_memory_bytes - self.reserved_with_overhead_bytes
+
+    @property
     def available_memory_bytes(self) -> int:
         return self.requested_memory_bytes - self.reserved_with_overhead_bytes
 
     @property
     def fits_usable_budget(self) -> bool:
+        return self.usable_headroom_bytes > 0
+
+    @property
+    def fits_requested_budget(self) -> bool:
         return self.available_memory_bytes > 0
 
     @property
@@ -205,6 +213,7 @@ def format_decode_ffn_budget_log(
         f"[ACTIVATION_MEMORY_CAPACITY] "
         f"nominal={budget.nominal_memory_bytes}B ({_mib(budget.nominal_memory_bytes):.2f} MiB), "
         f"usable={budget.usable_memory_bytes}B ({_mib(budget.usable_memory_bytes):.2f} MiB), "
+        f"requested={budget.requested_memory_bytes}B ({_mib(budget.requested_memory_bytes):.2f} MiB), "
         f"resident={budget.resident_weight_bytes}B ({_mib(budget.resident_weight_bytes):.2f} MiB), "
         f"staging_buffer={budget.staging_buffer_bytes}B ({_mib(budget.staging_buffer_bytes):.2f} MiB), "
         f"resident_plus_buffer={budget.resident_plus_buffer_bytes}B ({_mib(budget.resident_plus_buffer_bytes):.2f} MiB), "
@@ -227,14 +236,20 @@ def build_memory_budget_metrics(budget: DeviceMemoryBudget) -> dict[str, Any]:
         "nominal_memory_mib": _mib(budget.nominal_memory_bytes),
         "usable_memory_bytes": int(budget.usable_memory_bytes),
         "usable_memory_mib": _mib(budget.usable_memory_bytes),
+        "effective_utilization": float(budget.effective_utilization),
+        "requested_memory_bytes": int(budget.requested_memory_bytes),
+        "requested_memory_mib": _mib(budget.requested_memory_bytes),
         "planning_overhead_bytes": int(budget.planning_overhead_bytes),
         "planning_overhead_mib": _mib(budget.planning_overhead_bytes),
+        "non_kv_cache_overhead_bytes": int(budget.non_kv_cache_overhead_bytes),
         "resident_weight_bytes": int(budget.resident_weight_bytes),
         "staging_buffer_bytes": int(budget.staging_buffer_bytes),
         "resident_plus_buffer_bytes": int(budget.resident_plus_buffer_bytes),
         "reserved_with_overhead_bytes": int(budget.reserved_with_overhead_bytes),
-        "usable_headroom_bytes": int(budget.available_memory_bytes),
+        "usable_headroom_bytes": int(budget.usable_headroom_bytes),
+        "requested_headroom_bytes": int(budget.available_memory_bytes),
         "fits_usable_budget": bool(budget.fits_usable_budget),
+        "fits_requested_budget": bool(budget.fits_requested_budget),
         "utilization_percent": {
             "resident_of_nominal": _pct(budget.resident_weight_bytes, budget.nominal_memory_bytes),
             "resident_plus_buffer_of_nominal": budget.resident_plus_buffer_of_nominal_percent,

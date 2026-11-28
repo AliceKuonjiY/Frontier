@@ -15,6 +15,7 @@ from frontier.config import (
     ReplicaConfig,
     SimulationConfig,
     SyntheticRequestGeneratorConfig,
+    VllmV1SchedulerConfig,
     global_vars,
 )
 from frontier.config.device_sku_config import (
@@ -25,8 +26,14 @@ from frontier.config.device_sku_config import (
 from frontier.entities.replica import Replica
 from frontier.errors import FrontierMemoryOOMError
 from frontier.metrics.metrics_store import MetricsStore
+from frontier.scheduler.cluster_scheduler.round_robin_cluster_scheduler import (
+    RoundRobinClusterScheduler,
+)
 from frontier.scheduler.replica_scheduler.orca_replica_scheduler import (
     OrcaReplicaScheduler,
+)
+from frontier.scheduler.replica_scheduler.vllm_v1_engine_replica_scheduler import (
+    VLLMv1EngineReplicaScheduler,
 )
 from frontier.scheduler.replica_stage_scheduler.stage_execution_context import (
     StageExecutionContext,
@@ -124,6 +131,12 @@ def test_streamed_layers_require_supported_role_and_uniform_dense_weights(overri
 def test_invalid_usable_or_planning_overhead_overrides_fail_fast(overrides, match):
     with pytest.raises(ValueError, match=match):
         ffn_replica(2, **overrides)
+
+
+def test_has_relaxed_override_compares_net_usable_minus_overhead():
+    assert not ffn_replica(0, usable_memory_mb=180.0, planning_overhead_mb=20.0).has_relaxed_memory_budget_override()
+    assert not ffn_replica(0, usable_memory_mb=180.0, planning_overhead_mb=25.0).has_relaxed_memory_budget_override()
+    assert ffn_replica(0, usable_memory_mb=180.0, planning_overhead_mb=15.0).has_relaxed_memory_budget_override()
 
 
 def test_simulation_config_cli_parses_decode_ffn_sram_budget_flags():
@@ -246,6 +259,11 @@ def test_metrics_store_and_scheduler_report_nominal_192_mib_and_usable_170_mib(t
         cluster_cfg = ClusterConfig(
             num_replicas=None,
             replica_config=ReplicaConfig(model_name="Qwen3-4B"),
+            replica_scheduler_config=VllmV1SchedulerConfig(
+                gpu_memory_utilization=0.75,
+                num_blocks_mode="memory_planner_profiled",
+                non_kv_cache_overhead_bytes=512 * BINARY_MIB_BYTES,
+            ),
             prefill_cluster_num_replicas=1,
             decode_attn_cluster_num_replicas=1,
             decode_ffn_cluster_num_replicas=1,
@@ -255,14 +273,17 @@ def test_metrics_store_and_scheduler_report_nominal_192_mib_and_usable_170_mib(t
             prefill_replica_config_network_device="h200_dgx",
             prefill_replica_config_attn_tensor_parallel_size=8,
             prefill_replica_config_moe_tensor_parallel_size=8,
+            prefill_replica_scheduler_config_type="vllm_v1",
             decode_attn_replica_config_device="h200",
             decode_attn_replica_config_network_device="h200_dgx",
             decode_attn_replica_config_attn_tensor_parallel_size=8,
+            decode_attn_replica_scheduler_config_type="vllm_v1",
             decode_ffn_replica_config_device="hpp2",
             decode_ffn_replica_config_network_device="hpp2_16rank",
             decode_ffn_replica_config_moe_tensor_parallel_size=16,
             decode_ffn_replica_config_streamed_ffn_layers=2,
             decode_ffn_replica_config_memory_margin_fraction=0.0,
+            decode_ffn_replica_scheduler_config_type="orca",
             execution_time_predictor_config=RandomForrestExecutionTimePredictorConfig(
                 enable_dummy_mode=False,
             ),
@@ -279,7 +300,8 @@ def test_metrics_store_and_scheduler_report_nominal_192_mib_and_usable_170_mib(t
                 store_frontier_stage_batch_ledger=False,
             ),
         )
-        store = MetricsStore(sim_cfg, sim_cfg.get_clusters())
+        clusters = sim_cfg.get_clusters()
+        store = MetricsStore(sim_cfg, clusters)
         store._write_system_metrics()
         payload = json.loads(
             (Path(store._config.output_dir) / "system_metrics.json").read_text(encoding="utf-8")
@@ -295,11 +317,30 @@ def test_metrics_store_and_scheduler_report_nominal_192_mib_and_usable_170_mib(t
         assert ffn["device_info"]["planning_overhead_mib"] == 10.0
         assert ffn["weight_residency"]["resident_plus_buffer_bytes"] == 163_430_400
         assert ffn["memory_budget"]["usable_headroom_bytes"] == 4_341_760
+        assert ffn["memory_budget"]["requested_headroom_bytes"] == 4_341_760
+        assert ffn["memory_budget"]["fits_usable_budget"] is True
+        assert ffn["memory_budget"]["fits_requested_budget"] is True
         assert ffn["profiling_sram_contract"]["sram_fit_with_10mb_overhead"] is False
 
         prefill = payload["model_weight_memory"]["PREFILL"]
         assert prefill["nominal_memory_utilization_percent"] == pytest.approx(
             prefill["usable_memory_utilization_percent"]
+        )
+        assert prefill["memory_budget"]["effective_utilization"] == pytest.approx(0.75)
+        assert prefill["memory_budget"]["non_kv_cache_overhead_bytes"] == 512 * BINARY_MIB_BYTES
+        assert (
+            prefill["memory_budget"]["usable_headroom_bytes"]
+            == prefill["memory_budget"]["usable_memory_bytes"]
+            - prefill["memory_budget"]["reserved_with_overhead_bytes"]
+        )
+        assert (
+            prefill["memory_budget"]["requested_headroom_bytes"]
+            == prefill["memory_budget"]["requested_memory_bytes"]
+            - prefill["memory_budget"]["reserved_with_overhead_bytes"]
+        )
+        assert (
+            prefill["memory_budget"]["requested_headroom_bytes"]
+            < prefill["memory_budget"]["usable_headroom_bytes"]
         )
         assert "profiling_sram_contract" not in prefill
 
@@ -332,7 +373,70 @@ def test_metrics_store_and_scheduler_report_nominal_192_mib_and_usable_170_mib(t
         assert scheduler._activation_memory_capacity_bytes == 9_011_200
         cap_logs = [m for m in collector.messages if "[ACTIVATION_MEMORY_CAPACITY]" in m]
         assert len(cap_logs) == 1
-        for token in ("192.00 MiB", "170.00 MiB", "10.00 MiB", "158760960B", "169246720B", "9011200B"):
+        for token in (
+            "192.00 MiB",
+            "170.00 MiB",
+            "requested=",
+            "10.00 MiB",
+            "158760960B",
+            "169246720B",
+            "9011200B",
+        ):
             assert token in cap_logs[0]
+
+        # Non-Orca / explicit num_blocks DECODE_FFN scheduler must still enforce SRAM fail-fast.
+        infeasible_cfg = ffn_replica(0, memory_margin_fraction=0.0)
+        with pytest.raises(FrontierMemoryOOMError) as oom:
+            VLLMv1EngineReplicaScheduler(
+                replica_config=infeasible_cfg,
+                replica_scheduler_config=VllmV1SchedulerConfig(
+                    num_blocks_mode="explicit", num_blocks=16
+                ),
+                request_generator_config=generator_cfg,
+                replica=Replica(infeasible_cfg, generator_cfg, ClusterType.DECODE_FFN),
+                predictor=SimpleNamespace(
+                    _config=RandomForrestExecutionTimePredictorConfig(enable_dummy_mode=False)
+                ),
+                cluster_scheduler=SimpleNamespace(
+                    get_stage_execution_context=lambda rid, sid: StageExecutionContext(
+                        replica_id=rid, stage_id=sid, ep_size=1
+                    )
+                ),
+                cluster_type=ClusterType.DECODE_FFN,
+            )
+        assert oom.value.reason == "insufficient_activation_budget"
+
+        # Runtime M2N queue commit and direct enqueue fail fast atomically on activation overflow.
+        tight_target = SimpleNamespace(
+            _m2n_immediate_batch_queue=[],
+            _activation_bytes_allocated=10_000,
+            _activation_memory_capacity_bytes=12_000,
+        )
+        ok_target = SimpleNamespace(
+            _m2n_immediate_batch_queue=[],
+            _activation_bytes_allocated=0,
+            _activation_memory_capacity_bytes=100_000,
+        )
+        with pytest.raises(FrontierMemoryOOMError) as runtime_oom:
+            RoundRobinClusterScheduler._commit_decode_ffn_m2n_queue_operations(
+                SimpleNamespace(),
+                [
+                    (ok_target, SimpleNamespace(activation_bytes=4096)),
+                    (tight_target, SimpleNamespace(activation_bytes=4096)),
+                ],
+            )
+        assert runtime_oom.value.reason == "insufficient_activation_budget"
+        assert ok_target._m2n_immediate_batch_queue == []
+        assert ok_target._activation_bytes_allocated == 0
+        assert tight_target._m2n_immediate_batch_queue == []
+        assert tight_target._activation_bytes_allocated == 10_000
+
+        with pytest.raises(FrontierMemoryOOMError) as direct_oom:
+            scheduler.add_batch_to_m2n_queue(
+                SimpleNamespace(activation_bytes=scheduler._activation_memory_capacity_bytes + 1)
+            )
+        assert direct_oom.value.reason == "insufficient_activation_budget"
+        assert scheduler._activation_bytes_allocated == 0
+        assert scheduler._m2n_immediate_batch_queue == []
     finally:
         global_vars.reset_global_vars()

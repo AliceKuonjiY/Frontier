@@ -339,6 +339,7 @@ class BaseReplicaScheduler(ABC):
                 gpu_memory_utilization=planner_gpu_utilization,
                 non_kv_cache_overhead_bytes=planner_overhead_for_memory_estimation,
             )
+            memory_planner.validate_decode_ffn_sram_budget(decode_ffn_budget)
             self._activation_memory_capacity_bytes = max(
                 0, decode_ffn_budget.available_memory_bytes
             )
@@ -1185,10 +1186,10 @@ class BaseReplicaScheduler(ABC):
             batch: The batch portion assigned to this EP replica
         """
         if self._cluster_type == ClusterType.DECODE_FFN:
-            self._m2n_immediate_batch_queue.append(batch)
             activation_bytes = getattr(batch, "activation_bytes", None)
             if activation_bytes is not None:
                 self.add_activation_memory_bytes(int(activation_bytes))
+            self._m2n_immediate_batch_queue.append(batch)
         else:
             # For non-DECODE_FFN clusters, this method should not be called
             raise ValueError(f"add_batch_to_m2n_queue called on non-DECODE_FFN cluster: {self._cluster_type}")
@@ -1201,6 +1202,20 @@ class BaseReplicaScheduler(ABC):
         if activation_bytes < 0:
             raise ValueError(
                 f"activation_bytes must be non-negative, got {activation_bytes}"
+            )
+        capacity = self._activation_memory_capacity_bytes
+        if capacity is not None and self._activation_bytes_allocated + activation_bytes > capacity:
+            raise FrontierMemoryOOMError(
+                "DECODE_FFN activation bytes exceed remaining SRAM capacity "
+                f"(allocated={self._activation_bytes_allocated} B + "
+                f"incoming={activation_bytes} B > capacity={capacity} B).",
+                reason="insufficient_activation_budget",
+                details={
+                    "cluster_type": ClusterType.DECODE_FFN.name,
+                    "allocated_activation_bytes": self._activation_bytes_allocated,
+                    "incoming_activation_bytes": activation_bytes,
+                    "activation_memory_capacity_bytes": capacity,
+                },
             )
         self._activation_bytes_allocated += activation_bytes
 

@@ -2594,7 +2594,11 @@ class MetricsStore:
         model_weight_memory = {}
         for cluster_type, cluster_config in self._cluster_configs.items():
             try:
+                from dataclasses import is_dataclass
                 from frontier.scheduler.utils.memory_planner import MemoryPlanner
+                from frontier.scheduler.utils.replica_config import (
+                    resolve_replica_scheduler_config,
+                )
                 from frontier.scheduler.utils.sram_budget import (
                     build_memory_budget_metrics,
                     resolve_sram_profile_contract_for_cluster,
@@ -2612,12 +2616,32 @@ class MetricsStore:
                     replica_config=cluster_config.replica_config,
                     cluster_type=cluster_type,
                 )
+                base_scheduler_config = getattr(
+                    cluster_config, "replica_scheduler_config", None
+                )
+                scheduler_config = (
+                    resolve_replica_scheduler_config(cluster_config, cluster_type)
+                    if is_dataclass(base_scheduler_config)
+                    else base_scheduler_config
+                )
+                planner_gpu_utilization = getattr(
+                    scheduler_config, "gpu_memory_utilization", None
+                )
+                planner_non_kv_overhead = (
+                    int(getattr(scheduler_config, "non_kv_cache_overhead_bytes", 0))
+                    if getattr(scheduler_config, "num_blocks_mode", "memory_planner")
+                    == "memory_planner_profiled"
+                    else 0
+                )
                 memory_budget = MemoryPlanner(
                     replica_config=cluster_config.replica_config,
                     replica=None,
                     cluster_type=cluster_type,
                     sram_profile_contract=sram_profile_contract,
-                ).get_memory_budget()
+                ).get_memory_budget(
+                    gpu_memory_utilization=planner_gpu_utilization,
+                    non_kv_cache_overhead_bytes=planner_non_kv_overhead,
+                )
 
                 # Calculate model parameters and memory
                 num_params_per_device = param_counter.get_num_parameters_per_device()

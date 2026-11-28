@@ -91,15 +91,17 @@ case "$WEIGHT_STREAM_LAYERS" in
 esac
 
 # Strict binary MiB HPP2 SRAM guard: 170 MiB usable - 10 MiB overhead = 160 MiB.
-# At TP16, stream 0/1 needs 160.31 MiB on-chip (> 160 MiB), so fail fast unless
-# the caller explicitly overrides HPP2_USABLE_MEMORY_MB or HPP2_PLANNING_OVERHEAD_MB.
+# At TP16, stream 0/1 needs 36 * 4,669,440 B = 160.3125 MiB on-chip; fail fast
+# unless the numeric net budget (usable - overhead) is explicitly relaxed above 160.3125 MiB.
 if [ "$WEIGHT_STREAM_LAYERS" = "0" ] || [ "$WEIGHT_STREAM_LAYERS" = "1" ]; then
-  if [ "$HPP2_USABLE_MEMORY_MB" = "170" ] && [ "$HPP2_PLANNING_OVERHEAD_MB" = "10" ]; then
-    echo "ERROR: WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS requires 160.31 MiB + 10.00 MiB = 170.31 MiB > 170.00 MiB usable SRAM (nominal 192 MiB)." >&2
+  if awk -v u="$HPP2_USABLE_MEMORY_MB" -v o="$HPP2_PLANNING_OVERHEAD_MB" \
+    'BEGIN { num = "^[0-9]+(\\.[0-9]+)?$"; exit !(u ~ num && o ~ num && u > 0 && u <= 192 && o >= 0 && (u - o) > 160.3125) }'; then
+    echo "WARNING: Running WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS with relaxed HPP2 SRAM budget (usable=${HPP2_USABLE_MEMORY_MB} MiB, overhead=${HPP2_PLANNING_OVERHEAD_MB} MiB; default 170/10 MiB is infeasible)." >&2
+  else
+    echo "ERROR: WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS requires 160.31 MiB + ${HPP2_PLANNING_OVERHEAD_MB} MiB > ${HPP2_USABLE_MEMORY_MB} MiB usable SRAM (default 170.00 MiB usable / 10.00 MiB overhead, nominal 192 MiB)." >&2
     echo "       Use WEIGHT_STREAM_LAYERS=2 (155.86 + 10.00 = 165.86 MiB) or 3 (151.41 + 10.00 = 161.41 MiB), or override HPP2_USABLE_MEMORY_MB / HPP2_PLANNING_OVERHEAD_MB for diagnostics." >&2
     exit 2
   fi
-  echo "WARNING: Running WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS with overridden HPP2 SRAM budget (usable=${HPP2_USABLE_MEMORY_MB} MiB, overhead=${HPP2_PLANNING_OVERHEAD_MB} MiB; default 170/10 MiB is infeasible)." >&2
 fi
 
 case "$ARRIVAL_PATTERN" in

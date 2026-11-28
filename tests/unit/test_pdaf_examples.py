@@ -457,18 +457,34 @@ def test_qwen3_4b_defaults_to_stream2_with_binary_170_mib_and_10_mib_overhead(
     assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_planning_overhead_mb") == "10"
 
 
-@pytest.mark.parametrize("stream_layers", ["0", "1"])
+@pytest.mark.parametrize(
+    ("stream_layers", "extra_env"),
+    [
+        ("0", {}),
+        ("1", {}),
+        ("0", {"HPP2_USABLE_MEMORY_MB": "170.0", "HPP2_PLANNING_OVERHEAD_MB": "10.0"}),
+        ("0", {"HPP2_USABLE_MEMORY_MB": "169", "HPP2_PLANNING_OVERHEAD_MB": "10"}),
+        ("0", {"HPP2_USABLE_MEMORY_MB": "180", "HPP2_PLANNING_OVERHEAD_MB": "20"}),
+    ],
+)
 def test_qwen3_4b_rejects_infeasible_stream_layers_by_default(
-    tmp_path: Path, stream_layers: str
+    tmp_path: Path, stream_layers: str, extra_env: dict[str, str]
 ) -> None:
     env = os.environ.copy()
-    env.update({"OUT_DIR": (tmp_path / "out").as_posix(), "WEIGHT_STREAM_LAYERS": stream_layers})
+    env.update(
+        {
+            "OUT_DIR": (tmp_path / "out").as_posix(),
+            "WEIGHT_STREAM_LAYERS": stream_layers,
+            **extra_env,
+        }
+    )
     result = subprocess.run(
         ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
         cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode != 0
-    assert "170.00 MiB" in result.stderr
+    assert "ERROR:" in result.stderr
+    assert "WARNING:" not in result.stderr
     assert "WEIGHT_STREAM_LAYERS=2" in result.stderr
 
 

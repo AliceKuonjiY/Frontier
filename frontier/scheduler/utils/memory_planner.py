@@ -349,7 +349,7 @@ class MemoryPlanner:
 
         return num_blocks
 
-    def _validate_decode_ffn_sram_budget(self, budget: DeviceMemoryBudget) -> None:
+    def validate_decode_ffn_sram_budget(self, budget: DeviceMemoryBudget) -> None:
         contract = self._sram_profile_contract
         has_relaxed_override = bool(
             hasattr(self._replica_config, "has_relaxed_memory_budget_override")
@@ -374,8 +374,9 @@ class MemoryPlanner:
                     f"{budget.resident_plus_buffer_bytes / BINARY_MIB_BYTES:.2f} MiB + "
                     f"{budget.total_overhead_bytes / BINARY_MIB_BYTES:.2f} MiB = "
                     f"{budget.reserved_with_overhead_bytes / BINARY_MIB_BYTES:.2f} MiB > "
-                    f"{budget.requested_memory_bytes / BINARY_MIB_BYTES:.2f} MiB usable "
-                    f"(nominal {budget.nominal_memory_bytes / BINARY_MIB_BYTES:.2f} MiB, "
+                    f"requested {budget.requested_memory_bytes / BINARY_MIB_BYTES:.2f} MiB "
+                    f"(usable {budget.usable_memory_bytes / BINARY_MIB_BYTES:.2f} MiB, "
+                    f"nominal {budget.nominal_memory_bytes / BINARY_MIB_BYTES:.2f} MiB, "
                     f"streamed_ffn_layers={budget.streamed_ffn_layers})."
                 ),
                 details=details,
@@ -452,7 +453,7 @@ class MemoryPlanner:
         # the batch size is bounded by an activation-memory proxy.
         if kv_cache_memory_per_device_per_request == 0:
             if self._cluster_type == ClusterType.DECODE_FFN:
-                self._validate_decode_ffn_sram_budget(budget)
+                self.validate_decode_ffn_sram_budget(budget)
                 estimated_memory_per_request = max(
                     parameter_memory_per_device // 100,
                     1024 * 1024,

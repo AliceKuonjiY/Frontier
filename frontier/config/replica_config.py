@@ -306,10 +306,12 @@ class ReplicaConfig:
         return self.device_config.get_planning_overhead_bytes()
 
     def has_relaxed_memory_budget_override(self) -> bool:
-        """Return whether explicit config overrides relax the device SKU SRAM budget."""
-        return (
-            self.get_usable_memory_bytes()
-            > self.device_config.get_usable_memory_bytes()
-            or self.get_planning_overhead_bytes()
-            < self.device_config.get_planning_overhead_bytes()
+        """Return whether explicit config overrides relax the device SKU net SRAM budget."""
+        effective_net = (
+            self.get_usable_memory_bytes() - self.get_planning_overhead_bytes()
         )
+        default_net = (
+            self.device_config.get_usable_memory_bytes()
+            - self.device_config.get_planning_overhead_bytes()
+        )
+        return effective_net > default_net
