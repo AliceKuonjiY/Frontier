@@ -247,6 +247,22 @@ class ClusterConfig(ClusterRoleConfigBuilder, ClusterTopologySummary):
             "mode_dependency": "pd-af-disaggregation",
         },
     )
+    decode_ffn_replica_config_usable_memory_mb: Optional[float] = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "Usable per-device memory budget in binary MiB (1024^2 bytes) for decode FFN cluster.",
+            "mode_dependency": "pd-af-disaggregation",
+        },
+    )
+    decode_ffn_replica_config_planning_overhead_mb: Optional[float] = field(
+        default=None,
+        kw_only=True,
+        metadata={
+            "help": "Fixed per-device planning overhead in binary MiB (1024^2 bytes) for decode FFN cluster.",
+            "mode_dependency": "pd-af-disaggregation",
+        },
+    )
     decode_ffn_replica_config_num_pipeline_stages: Optional[int] = field(
         default=None,
         metadata={

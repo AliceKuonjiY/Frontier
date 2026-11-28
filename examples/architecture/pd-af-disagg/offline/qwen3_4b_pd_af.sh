@@ -35,7 +35,9 @@ NUM_REQUESTS="${NUM_REQUESTS:-8}"
 PREFILL_TOKENS="${PREFILL_TOKENS:-512}"
 DECODE_TOKENS="${DECODE_TOKENS:-64}"
 ARRIVAL_PATTERN="${ARRIVAL_PATTERN:-burst}"
-WEIGHT_STREAM_LAYERS="${WEIGHT_STREAM_LAYERS:-0}"
+WEIGHT_STREAM_LAYERS="${WEIGHT_STREAM_LAYERS:-2}"
+HPP2_USABLE_MEMORY_MB="${HPP2_USABLE_MEMORY_MB:-170}"
+HPP2_PLANNING_OVERHEAD_MB="${HPP2_PLANNING_OVERHEAD_MB:-10}"
 AF_MICRO_BATCH="${AF_MICRO_BATCH:-1}"
 DECODE_ATTN_MICRO_BATCH_SIZE="${DECODE_ATTN_MICRO_BATCH_SIZE:-8}"
 
@@ -87,6 +89,18 @@ case "$WEIGHT_STREAM_LAYERS" in
     exit 2
     ;;
 esac
+
+# Strict binary MiB HPP2 SRAM guard: 170 MiB usable - 10 MiB overhead = 160 MiB.
+# At TP16, stream 0/1 needs 160.31 MiB on-chip (> 160 MiB), so fail fast unless
+# the caller explicitly overrides HPP2_USABLE_MEMORY_MB or HPP2_PLANNING_OVERHEAD_MB.
+if [ "$WEIGHT_STREAM_LAYERS" = "0" ] || [ "$WEIGHT_STREAM_LAYERS" = "1" ]; then
+  if [ "$HPP2_USABLE_MEMORY_MB" = "170" ] && [ "$HPP2_PLANNING_OVERHEAD_MB" = "10" ]; then
+    echo "ERROR: WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS requires 160.31 MiB + 10.00 MiB = 170.31 MiB > 170.00 MiB usable SRAM (nominal 192 MiB)." >&2
+    echo "       Use WEIGHT_STREAM_LAYERS=2 (155.86 + 10.00 = 165.86 MiB) or 3 (151.41 + 10.00 = 161.41 MiB), or override HPP2_USABLE_MEMORY_MB / HPP2_PLANNING_OVERHEAD_MB for diagnostics." >&2
+    exit 2
+  fi
+  echo "WARNING: Running WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS with overridden HPP2 SRAM budget (usable=${HPP2_USABLE_MEMORY_MB} MiB, overhead=${HPP2_PLANNING_OVERHEAD_MB} MiB; default 170/10 MiB is infeasible)." >&2
+fi
 
 case "$ARRIVAL_PATTERN" in
   burst)
@@ -154,6 +168,8 @@ CMD=(
   --cluster_config_decode_ffn_replica_config_router_topk 1
   --cluster_config_decode_ffn_replica_config_device hpp2
   --cluster_config_decode_ffn_replica_config_streamed_ffn_layers "$WEIGHT_STREAM_LAYERS"
+  --cluster_config_decode_ffn_replica_config_usable_memory_mb "$HPP2_USABLE_MEMORY_MB"
+  --cluster_config_decode_ffn_replica_config_planning_overhead_mb "$HPP2_PLANNING_OVERHEAD_MB"
   --cluster_config_decode_ffn_replica_config_network_device hpp2_16rank
   --cluster_config_decode_ffn_replica_config_memory_margin_fraction 0.0
 
@@ -228,9 +244,9 @@ echo " Qwen3-4B PD-AF"
 echo " model: Qwen3-4B"
 echo " PREFILL:    h200 x8, attn TP8"
 echo " DECODE_ATTN:h200 x8, attn TP8"
-echo " DECODE_FFN: hpp2 x8/16 ranks, FFN TP16"
+echo " DECODE_FFN: hpp2 x8/16 ranks, FFN TP16 (usable=${HPP2_USABLE_MEMORY_MB} MiB, overhead=${HPP2_PLANNING_OVERHEAD_MB} MiB, nominal=192 MiB)"
 echo " requests:   $NUM_REQUESTS, prefill=$PREFILL_TOKENS, decode=$DECODE_TOKENS; $ARRIVAL_DESCRIPTION"
-echo " weight stream: $WEIGHT_STREAM_LAYERS layer(s) (0 = all resident)"
+echo " weight stream: $WEIGHT_STREAM_LAYERS layer(s)"
 echo " metrics:    $OUT_DIR/$RUN_ID"
 echo "========================================================="
 exec "${CMD[@]}"

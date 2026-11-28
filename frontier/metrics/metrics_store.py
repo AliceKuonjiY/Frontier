@@ -2594,14 +2594,30 @@ class MetricsStore:
         model_weight_memory = {}
         for cluster_type, cluster_config in self._cluster_configs.items():
             try:
-                # Import ParamCounter for model weight calculations
+                from frontier.scheduler.utils.memory_planner import MemoryPlanner
+                from frontier.scheduler.utils.sram_budget import (
+                    build_memory_budget_metrics,
+                    resolve_sram_profile_contract_for_cluster,
+                )
                 from frontier.utils.param_counter import ParamCounter
 
-                # Create ParamCounter for this cluster configuration
                 param_counter = ParamCounter(
                     replica_config=cluster_config.replica_config,
                     cluster_type=cluster_type,
                 )
+                sram_profile_contract = resolve_sram_profile_contract_for_cluster(
+                    predictor_config=getattr(
+                        cluster_config, "execution_time_predictor_config", None
+                    ),
+                    replica_config=cluster_config.replica_config,
+                    cluster_type=cluster_type,
+                )
+                memory_budget = MemoryPlanner(
+                    replica_config=cluster_config.replica_config,
+                    replica=None,
+                    cluster_type=cluster_type,
+                    sram_profile_contract=sram_profile_contract,
+                ).get_memory_budget()
 
                 # Calculate model parameters and memory
                 num_params_per_device = param_counter.get_num_parameters_per_device()
@@ -2615,9 +2631,7 @@ class MetricsStore:
 
                 # Calculate memory in bytes.  Attention/MTP keep the 2-byte
                 # approximation; the MLP term follows the configured FP8 width.
-                model_weight_memory_bytes = (
-                    param_counter.get_parameter_memory_per_device_bytes()
-                )
+                model_weight_memory_bytes = memory_budget.resident_weight_bytes
                 model_weight_memory_gb = model_weight_memory_bytes / (1024**3)
 
                 # Calculate memory breakdown
@@ -2634,15 +2648,18 @@ class MetricsStore:
                     * num_mlp_params_per_device
                 ) - param_counter.get_streamed_ffn_weight_bytes_per_device()
 
-                # Calculate memory utilization percentage
+                # Default memory_utilization_percent uses resident_plus_buffer / usable.
                 total_device_memory_gb = (
                     cluster_config.replica_config.device_config.total_memory_gb
                 )
-                memory_utilization_percent = (
-                    (model_weight_memory_gb / total_device_memory_gb) * 100
-                    if total_device_memory_gb > 0
-                    else 0
+                memory_budget_payload = build_memory_budget_metrics(memory_budget)
+                nominal_memory_utilization_percent = (
+                    memory_budget.resident_plus_buffer_of_nominal_percent
                 )
+                usable_memory_utilization_percent = (
+                    memory_budget.resident_plus_buffer_of_usable_percent
+                )
+                memory_utilization_percent = usable_memory_utilization_percent
 
                 # Extract parallel parameters based on cluster type
                 replica_config = cluster_config.replica_config
@@ -2681,6 +2698,12 @@ class MetricsStore:
                     "total_memory_bytes": int(model_weight_memory_bytes),
                     "total_memory_gb": float(model_weight_memory_gb),
                     "memory_utilization_percent": float(memory_utilization_percent),
+                    "nominal_memory_utilization_percent": float(
+                        nominal_memory_utilization_percent
+                    ),
+                    "usable_memory_utilization_percent": float(
+                        usable_memory_utilization_percent
+                    ),
                     "breakdown": {
                         "attention_parameters": int(
                             num_attention_params_per_layer
@@ -2700,6 +2723,9 @@ class MetricsStore:
                     "device_info": {
                         "device_type": cluster_config.replica_config.device_config.get_type().name,
                         "total_device_memory_gb": float(total_device_memory_gb),
+                        "nominal_device_memory_mib": memory_budget_payload["nominal_memory_mib"],
+                        "usable_device_memory_mib": memory_budget_payload["usable_memory_mib"],
+                        "planning_overhead_mib": memory_budget_payload["planning_overhead_mib"],
                         "num_replicas": cluster_config.num_replicas,
                         "expert_parallel_size": getattr(
                             cluster_config.replica_config, "moe_expert_parallel_size", 1
@@ -2708,14 +2734,21 @@ class MetricsStore:
                             cluster_config.replica_config, "moe_tensor_parallel_size", 1
                         ),
                     },
+                    "memory_budget": memory_budget_payload,
                 }
+                if sram_profile_contract is not None:
+                    cluster_memory_info["profiling_sram_contract"] = (
+                        sram_profile_contract.to_metrics_dict()
+                    )
 
                 if cluster_type == ClusterType.DECODE_FFN:
                     cluster_memory_info["weight_residency"] = {
                         "streamed_ffn_layers": getattr(replica_config, "streamed_ffn_layers", 0),
                         "resident_weight_bytes": model_weight_memory_bytes,
                         "off_device_weight_bytes": param_counter.get_streamed_ffn_weight_bytes_per_device(),
-                        "planned_staging_buffer_bytes": param_counter.get_ffn_streaming_buffer_bytes_per_device(),
+                        "planned_staging_buffer_bytes": memory_budget.staging_buffer_bytes,
+                        "resident_plus_buffer_bytes": memory_budget.resident_plus_buffer_bytes,
+                        "reserved_with_overhead_bytes": memory_budget.reserved_with_overhead_bytes,
                         "measured_peak_bytes": None,
                     }
                 model_weight_memory[cluster_type.name] = cluster_memory_info

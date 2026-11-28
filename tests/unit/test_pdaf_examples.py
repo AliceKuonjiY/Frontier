@@ -442,3 +442,60 @@ def test_qwen3_4b_af_microbatch_defaults_and_overrides(tmp_path: Path) -> None:
     assert _option_value(
         af2_argv, "--cluster_config_decode_attn_micro_batch_size"
     ) == "32"
+
+
+def test_qwen3_4b_defaults_to_stream2_with_binary_170_mib_and_10_mib_overhead(
+    tmp_path: Path,
+) -> None:
+    argv = _capture_cli(
+        tmp_path,
+        "offline/qwen3_4b_pd_af.sh",
+        env_overrides={"OUT_DIR": (tmp_path / "out").as_posix()},
+    )
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_streamed_ffn_layers") == "2"
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_usable_memory_mb") == "170"
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_planning_overhead_mb") == "10"
+
+
+@pytest.mark.parametrize("stream_layers", ["0", "1"])
+def test_qwen3_4b_rejects_infeasible_stream_layers_by_default(
+    tmp_path: Path, stream_layers: str
+) -> None:
+    env = os.environ.copy()
+    env.update({"OUT_DIR": (tmp_path / "out").as_posix(), "WEIGHT_STREAM_LAYERS": stream_layers})
+    result = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "170.00 MiB" in result.stderr
+    assert "WEIGHT_STREAM_LAYERS=2" in result.stderr
+
+
+def test_qwen3_4b_allows_diagnostic_override_for_stream0_with_warning(
+    tmp_path: Path,
+) -> None:
+    capture_path = tmp_path / "diag.argv"
+    fake_python = tmp_path / "capture_python.sh"
+    fake_python.write_bytes(b"#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE_PATH\"\n")
+    fake_python.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "CAPTURE_PATH": capture_path.as_posix(),
+            "PYTHON_BIN": fake_python.as_posix(),
+            "OUT_DIR": (tmp_path / "out").as_posix(),
+            "WEIGHT_STREAM_LAYERS": "0",
+            "HPP2_USABLE_MEMORY_MB": "192",
+            "HPP2_PLANNING_OVERHEAD_MB": "0",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WARNING:" in result.stderr
+    argv = capture_path.read_text(encoding="utf-8").splitlines()
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_usable_memory_mb") == "192"
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_planning_overhead_mb") == "0"
