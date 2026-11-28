@@ -62,6 +62,7 @@ import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
+from importlib.metadata import PackageNotFoundError, version as package_version
 
 try:
     import fcntl
@@ -82,6 +83,7 @@ HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[1]
 RUNS_ROOT = REPO_ROOT / "outputs" / "runs"
 DEFAULT_WORKERS = 3
+DEFAULT_TRAINING_THREADS = 1
 DEFAULT_TIMEOUT_S = 3600
 
 # main() 会根据 --output-dir 重新绑定这些全局变量；模块级默认值只为
@@ -652,6 +654,7 @@ CALIBRATION10_NAMES = {
 def build_command(
     exp: Experiment,
     metrics_output_dir: Path | None = None,
+    training_threads: int = DEFAULT_TRAINING_THREADS,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -794,6 +797,8 @@ def build_command(
         str(exp.seed),
         "--random_forrest_execution_time_predictor_config_k_fold_cv_splits",
         "3",
+        "--random_forrest_execution_time_predictor_config_num_training_job_threads",
+        str(training_threads),
         # Metrics
         "--metrics_config_output_dir",
         str(metrics_output_dir or OUT_ROOT),
@@ -1084,6 +1089,7 @@ def run_one(
     source: dict[str, Any],
     run_fp: str,
     output_dir: Path,
+    training_threads: int = DEFAULT_TRAINING_THREADS,
 ) -> tuple[str, dict[str, Any] | None, str | None, float]:
     if CANCEL_EVENT.is_set():
         return exp.name, None, "cancelled", 0.0
@@ -1113,7 +1119,7 @@ def run_one(
     env.setdefault("OMP_NUM_THREADS", "2")
     env.setdefault("OPENBLAS_NUM_THREADS", "2")
 
-    cmd = build_command(exp, attempt_root)
+    cmd = build_command(exp, attempt_root, training_threads)
     (attempt_root / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
     t0 = time.time()
     popen_kwargs: dict[str, Any] = {}
@@ -1181,13 +1187,6 @@ def run_one(
         return exp.name, None, "missing metrics files", elapsed
     attempt_result_dir = attempt_metrics_root / exp.name
     canonical_dir = METRICS_ROOT / exp.name
-    try:
-        publish_metrics(attempt_result_dir, canonical_dir)
-    except Exception as exc:  # noqa: BLE001 - keep the worker alive
-        return exp.name, None, f"publish failed: {exc}", elapsed
-    if not source_matches():
-        withdraw_published(exp, output_dir)
-        return exp.name, None, "source changed during publish; result rejected", elapsed
     row.update(source)
     row["config_fingerprint"] = config_fingerprint(exp)
     row["run_fingerprint"] = run_fp
@@ -1223,8 +1222,18 @@ def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
         except (OSError, subprocess.CalledProcessError):
             return ""
 
-    status = _run("status", "--porcelain")
-    diff = _run("diff", "--binary", "HEAD")
+    pathspec: list[str] = []
+    for root in excluded:
+        try:
+            rel = root.relative_to(REPO_ROOT)
+        except ValueError:
+            continue
+        if rel == Path("."):
+            continue
+        pathspec.append(f":(exclude,top){rel.as_posix()}")
+    source_scope = ["--", ".", *pathspec] if pathspec else []
+    status = _run("status", "--porcelain", *source_scope)
+    diff = _run("diff", "--binary", "HEAD", *source_scope)
     untracked_digest = hashlib.sha256()
     for rel in sorted(filter(None, _run("ls-files", "--others", "--exclude-standard", "-z").split("\0"))):
         if _is_excluded(rel):
@@ -1252,6 +1261,38 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _package_version(name: str) -> str:
+    try:
+        return package_version(name)
+    except PackageNotFoundError:
+        return "missing"
+
+
+def environment_identity() -> dict[str, str]:
+    dependencies = {
+        "scikit-learn": _package_version("scikit-learn"),
+        "numpy": _package_version("numpy"),
+        "pandas": _package_version("pandas"),
+        "scipy": _package_version("scipy"),
+    }
+    payload = {
+        "python_version": platform.python_version(),
+        "python_executable": os.path.realpath(sys.executable),
+        "dependencies": dependencies,
+    }
+    return {
+        "source_python_version": payload["python_version"],
+        "source_python_executable": payload["python_executable"],
+        "source_sklearn_version": dependencies["scikit-learn"],
+        "source_numpy_version": dependencies["numpy"],
+        "source_pandas_version": dependencies["pandas"],
+        "source_scipy_version": dependencies["scipy"],
+        "source_environment_fingerprint": _sha256_text(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        )[:16],
+    }
+
+
 def current_source(
     git: dict[str, Any] | None = None,
     exclude_paths: Iterable[Path] = (),
@@ -1259,7 +1300,7 @@ def current_source(
     """Identity of the working tree that produced a result row."""
     git = git or git_info(exclude_paths=exclude_paths)
     status = git.get("status_porcelain", "")
-    return {
+    source = {
         "source_commit": git.get("head") or "nogit",
         "source_short_commit": git.get("short_head") or "nogit",
         "source_branch": git.get("branch") or "",
@@ -1268,6 +1309,8 @@ def current_source(
         "source_diff_hash": git.get("diff_hash", ""),
         "source_untracked_hash": git.get("untracked_hash", ""),
     }
+    source.update(environment_identity())
+    return source
 
 
 def config_fingerprint(exp: Experiment) -> str:
@@ -1290,11 +1333,22 @@ def run_fingerprint(exp: Experiment, source: dict[str, Any]) -> str:
     return _sha256_text(payload)
 
 
-def load_existing(results_csv: Path) -> dict[str, dict[str, Any]]:
+def load_existing_rows(results_csv: Path) -> list[dict[str, Any]]:
     if not results_csv.exists():
-        return {}
+        return []
     with results_csv.open(encoding="utf-8", newline="") as f:
-        return {r["name"]: r for r in csv.DictReader(f)}
+        return list(csv.DictReader(f))
+
+
+def latest_by_name(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        latest[row["name"]] = row
+    return latest
+
+
+def load_existing(results_csv: Path) -> dict[str, dict[str, Any]]:
+    return latest_by_name(load_existing_rows(results_csv))
 
 
 def _csv_safe(value: Any) -> Any:
@@ -1319,8 +1373,7 @@ def save_csv(rows: list[dict[str, Any]], results_csv: Path) -> None:
     A crash during a truncate-and-write could otherwise leave a zero-byte or
     half-written CSV.  The temporary file lives on the same filesystem and is
     atomically renamed into place.  An empty result set still publishes a
-    header-only CSV, so a failed forced rerun removes its old row instead of
-    leaving a stale one behind.
+    header-only CSV, which is used when no current-source result remains.
     """
     results_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames: list[str] = []
@@ -1436,8 +1489,9 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
     pending_in_table = pending_set & row_names
     historical = max(0, len(all_rows) - len(rows) - len(pending_in_table))
     out.append(
-        f"- 结果 {len(all_rows)} 条（当前源码 {len(rows)}，历史 {historical}，"
-        f"待重跑 {len(pending_set)}；本次运行 {manifest.get('num_run', '—')}，"
+        f"- 结果 {len(all_rows)} 条（历史尝试 {manifest.get('num_attempts', '—')}；"
+        f"当前源码 {len(rows)}，历史 {historical}，待重跑 {len(pending_set)}；"
+        f"本次运行 {manifest.get('num_run', '—')}，"
         f"缓存 {manifest.get('num_cached', '—')}）；失败 {len(failures)}"
         + (f"；中断取消 {cancelled}" if cancelled else "")
     )
@@ -1666,15 +1720,16 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
                 name,
                 r.get("source_short_commit", "—"),
                 r.get("source_dirty", "—"),
+                (r.get("source_environment_fingerprint") or "—")[:8],
                 (fp or "—")[:12],
                 state,
             ])
         out.append(_table(
-            ["配置", "commit", "dirty", "run_fingerprint", "当前源码"],
+            ["配置", "commit", "dirty", "env", "run_fingerprint", "当前源码"],
             provenance_rows,
         ))
         stale_count = sum(
-            1 for row in provenance_rows if row[4] in ("旧/不匹配", "无指纹", "待重跑")
+            1 for row in provenance_rows if row[5] in ("旧/不匹配", "无指纹", "待重跑")
         )
         if stale_count:
             out.append("")
@@ -1923,6 +1978,8 @@ def main() -> int:
                         help=f"并行 worker 数（默认 {DEFAULT_WORKERS}；内存 <8GB 建议不超过 3）")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S,
                         help=f"单次仿真超时秒数（默认 {DEFAULT_TIMEOUT_S}）")
+    parser.add_argument("--training-threads", type=int, default=DEFAULT_TRAINING_THREADS,
+                        help=f"每个仿真 sklearn GridSearchCV 的 n_jobs（默认 {DEFAULT_TRAINING_THREADS}）")
     parser.add_argument("--include-experimental", action="store_true",
                         help="包含 tier=experimental 的配置（例如 DECODE_ATTN PP>1，需要模拟器先支持）")
     parser.add_argument("--force", action="store_true",
@@ -1935,6 +1992,8 @@ def main() -> int:
 
     if args.workers < 1:
         parser.error("--workers 必须 >= 1")
+    if args.training_threads < 1:
+        parser.error("--training-threads 必须 >= 1")
 
     selected = select_configs(args)
     if not selected:
@@ -2033,16 +2092,19 @@ def main() -> int:
     config_fps = {c.name: config_fingerprint(c) for c in selected}
     run_fps = {c.name: all_run_fps[c.name] for c in selected}
 
-    existing = load_existing(RESULTS_CSV)
-    rows_by_name: dict[str, dict[str, Any]] = dict(existing)
+    history_rows = load_existing_rows(RESULTS_CSV)
+    rows_by_name: dict[str, dict[str, Any]] = latest_by_name(history_rows)
+    current_by_name: dict[str, dict[str, Any]] = {}
+    for existing_row in history_rows:
+        if existing_row.get("run_fingerprint") == all_run_fps.get(existing_row["name"]):
+            current_by_name[existing_row["name"]] = existing_row
 
     def cache_state(exp: Experiment) -> str:
         if pending_path(exp).exists():
             return "pending"
-        row = rows_by_name.get(exp.name)
-        if row is None:
-            return "missing"
-        return "current" if row.get("run_fingerprint") == run_fps[exp.name] else "stale"
+        if exp.name in current_by_name:
+            return "current"
+        return "stale" if exp.name in rows_by_name else "missing"
 
     stale = [c for c in selected if cache_state(c) == "stale"]
     to_run = [c for c in selected if args.force or cache_state(c) != "current"]
@@ -2065,6 +2127,7 @@ def main() -> int:
         "force": bool(args.force),
         "stages": sorted(stages),
         "workers": args.workers,
+        "training_threads": args.training_threads,
         "timeout_s": args.timeout,
         "python": sys.executable,
         "python_version": platform.python_version(),
@@ -2098,22 +2161,35 @@ def main() -> int:
     manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
     manifest_path.write_text(manifest_text, encoding="utf-8")
     run_manifest_path.write_text(manifest_text, encoding="utf-8")
-    commands_text = "\n\n".join(" ".join(build_command(c)) for c in selected)
+    commands_text = "\n\n".join(
+        " ".join(build_command(c, training_threads=args.training_threads))
+        for c in selected
+    )
     (output_dir / "commands.txt").write_text(commands_text, encoding="utf-8")
     run_commands_path.write_text(commands_text, encoding="utf-8")
 
+    def preferred_row(name: str) -> dict[str, Any] | None:
+        return current_by_name.get(name) or rows_by_name.get(name)
+
     def ordered_rows() -> list[dict[str, Any]]:
-        ordered = [rows_by_name[c.name] for c in selected if c.name in rows_by_name]
+        ordered = [
+            preferred_row(c.name)
+            for c in selected
+            if preferred_row(c.name) is not None
+        ]
         seen = {row["name"] for row in ordered}
-        ordered.extend(row for name, row in rows_by_name.items() if name not in seen)
+        for name in rows_by_name:
+            if name not in seen:
+                row = preferred_row(name)
+                if row is not None:
+                    ordered.append(row)
         return ordered
 
     def current_rows_now() -> list[dict[str, Any]]:
         pending = {p.stem for p in pending_dir.glob("*.json")}
         return [
-            r for r in ordered_rows()
-            if r.get("run_fingerprint") == all_run_fps.get(r["name"])
-            and r["name"] not in pending
+            r for r in current_by_name.values()
+            if r["name"] not in pending
         ]
 
     print()
@@ -2151,7 +2227,15 @@ def main() -> int:
     t_start = time.time()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
     futures = {
-        pool.submit(run_one, c, args.timeout, source, run_fps[c.name], output_dir): c
+        pool.submit(
+            run_one,
+            c,
+            args.timeout,
+            source,
+            run_fps[c.name],
+            output_dir,
+            args.training_threads,
+        ): c
         for c in to_run
     }
     try:
@@ -2162,17 +2246,33 @@ def main() -> int:
                 name, row, err, elapsed = future.result()
             except Exception as exc:  # noqa: BLE001 - report worker crash
                 name, row, err, elapsed = exp.name, None, f"worker crashed: {exc}", 0.0
+            if not err:
+                # Publishing on the main thread closes the Ctrl-C window where
+                # a worker had already written the fixed metrics path but the
+                # pending marker and CSV were never updated.
+                if current_source(exclude_paths=[output_dir]) != source:
+                    err = "source changed before publish; result rejected"
+                else:
+                    try:
+                        publish_metrics(
+                            Path(row["metrics_dir"]),
+                            Path(row["published_dir"]),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report as failure
+                        err = f"publish failed: {exc}"
+                if not err and current_source(exclude_paths=[output_dir]) != source:
+                    withdraw_published(exp, output_dir)
+                    err = "source changed during publish; result rejected"
             if err:
                 failures.append((name, err))
-                # A forced rerun that fails must not leave a stale row that
-                # looks like the new simulator produced it.
-                rows_by_name.pop(name, None)
-                save_csv(ordered_rows(), RESULTS_CSV)
+                withdraw_published(exp, output_dir)
                 print(f"[{done}/{len(to_run)}] FAIL {name}: {err} ({elapsed}s)", flush=True)
             else:
                 rows_by_name[name] = row
+                current_by_name[name] = row
+                history_rows.append(row)
                 ok_names.add(name)
-                save_csv(ordered_rows(), RESULTS_CSV)
+                save_csv(history_rows, RESULTS_CSV)
                 pending_path(exp).unlink(missing_ok=True)
                 print(
                     f"[{done}/{len(to_run)}] OK   {name:46s} ({elapsed:6.1f}s) | "
@@ -2193,8 +2293,14 @@ def main() -> int:
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
 
+    # A pending case must never leave a published fixed path behind, including
+    # results that finished in a worker while the main loop was interrupted.
+    for exp in selected:
+        if pending_path(exp).exists():
+            withdraw_published(exp, output_dir)
+
     ordered = ordered_rows()
-    save_csv(ordered, RESULTS_CSV)
+    save_csv(history_rows, RESULTS_CSV)
     pending_names = sorted(p.stem for p in pending_dir.glob("*.json"))
     pending_set = set(pending_names)
     current_rows = current_rows_now()
@@ -2207,6 +2313,7 @@ def main() -> int:
     manifest["num_cancelled"] = num_cancelled if interrupted else 0
     manifest["interrupted"] = interrupted
     manifest["num_results"] = len(ordered)
+    manifest["num_attempts"] = len(history_rows)
     manifest["num_current_results"] = len(current_rows)
     manifest["pending"] = pending_names
     manifest["num_pending"] = len(pending_names)

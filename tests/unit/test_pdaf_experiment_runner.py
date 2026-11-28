@@ -6,6 +6,7 @@ import csv
 import dataclasses
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -60,6 +61,9 @@ def test_fingerprints_change_with_config_and_source() -> None:
     assert run_fp == runner.run_fingerprint(exp, source)
     assert config_fp != runner.config_fingerprint(dataclasses.replace(exp, af_mb=2))
     assert run_fp != runner.run_fingerprint(exp, {**source, "source_diff_hash": "3" * 16})
+    assert run_fp != runner.run_fingerprint(
+        exp, {**source, "source_environment_fingerprint": "4" * 16}
+    )
 
 
 def test_extract_metrics_rejects_incomplete_requests(
@@ -100,6 +104,40 @@ def test_preflight_rejects_missing_streamed_cpu_overhead_table(
     exp = _experiment("ws3_g16_p8d8_af1_f1")
     with pytest.raises(SystemExit):
         runner.preflight("core", {exp.stage}, [exp])
+
+
+def test_git_info_excludes_output_dir_from_status_and_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "base"],
+        cwd=repo,
+        check=True,
+    )
+    tracked = repo / "src" / "tracked.py"
+    tracked.parent.mkdir()
+    tracked.write_text("x = 1\n")
+    subprocess.run(["git", "add", "src/tracked.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "source"],
+        cwd=repo,
+        check=True,
+    )
+
+    monkeypatch.setattr(runner, "REPO_ROOT", repo)
+    baseline = runner.git_info()
+    assert baseline["status_porcelain"] == ""
+
+    out = repo / "src" / "out"
+    out.mkdir()
+    (out / "manifest.json").write_text("{}")
+    filtered = runner.git_info(exclude_paths=[out])
+    assert filtered["status_porcelain"] == ""
+    assert filtered["diff_hash"] == baseline["diff_hash"]
+    assert filtered["untracked_hash"] == baseline["untracked_hash"]
 
 
 def test_summary_handles_na_and_empty_numeric_fields(tmp_path: Path) -> None:
@@ -169,6 +207,15 @@ def test_build_command_passes_synthetic_seed() -> None:
     assert cmd[idx + 1] == "3"
     idx = cmd.index("--poisson_request_interval_generator_config_seed")
     assert cmd[idx + 1] == "3"
+    idx = cmd.index(
+        "--random_forrest_execution_time_predictor_config_num_training_job_threads"
+    )
+    assert cmd[idx + 1] == "1"
+    cmd = runner.build_command(exp, training_threads=2)
+    idx = cmd.index(
+        "--random_forrest_execution_time_predictor_config_num_training_job_threads"
+    )
+    assert cmd[idx + 1] == "2"
 
 
 def test_default_output_dirs_are_unique(

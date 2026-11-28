@@ -13,6 +13,7 @@
 | --include-experimental      | 关闭                   | 加入 tier=experimental 的配置 | 主要是 DECODE_ATTN PP>1，当前模拟器可能仍拒绝    |
 | --output-dir PATH           | outputs/runs/<时间戳>_<commit> | 指定输出目录                  | 相对路径按 outputs/runs 解析；复用同一目录即断点续跑 |
 | --workers N                 | 3                      | 并行仿真进程数                | 8 GB 内存建议不超过 3                            |
+| --training-threads N        | 1                      | 每个仿真 GridSearchCV 的 n_jobs | 冷缓存首跑建议 1；不要与 workers 一起放大         |
 | --timeout N                 | 3600                   | 单次仿真超时秒数              | 400 请求长跑可设 7200                            |
 | --force                     | 关闭                   | 强制重跑选中配置              | 保留其他 stage 的结果；详见第 5 节               |
 | --list                      | -                      | 只列出选中的配置              | 不跑仿真                                         |
@@ -44,8 +45,8 @@ cd Frontier/examples/run_experiments
 Frontier/outputs/runs/<YYYYmmdd_HHMMSS>_<commit>/
 ├── manifest.json          # 最近一次运行；完整历史在 manifests/<run_id>.json
 ├── commands.txt           # 最近一次运行的命令模板
-├── sweep_results.csv      # 全部历史/本次结果；中断后可用同一目录续跑
-├── current_results.csv    # 只含当前源码+配置指纹匹配的结果
+├── sweep_results.csv      # 追加式历史：每次成功尝试一行；可断点续跑
+├── current_results.csv    # 每个配置只保留当前源码+指纹匹配的最新行
 ├── summary.md             # 自动生成的汇总表（排名只用 current 行）
 ├── manifests/<run_id>.json
 ├── summaries/<run_id>.md
@@ -171,6 +172,9 @@ python   = Frontier/.venv/bin/python
 源码指纹；如果发现变化，该结果会被拒绝并保持“待重跑”状态，不会混入
 `current_results.csv`。
 
+运行指纹同时包含 Python 版本/路径以及 scikit-learn、numpy、pandas、scipy
+版本；更换 `PYTHON_BIN` 或升级依赖后，旧结果不会被复用。
+
 ## 5. 断点续跑
 
 默认每次运行都会新建 `outputs/runs/<时间戳>_<commit>/`，不会复用旧结果。  
@@ -181,8 +185,9 @@ python   = Frontier/.venv/bin/python
 ./run_experiments.sh --output-dir 20261128_101500_9e4fa41
 ```
 
-已出现在 `sweep_results.csv` 里的配置会跳过，但只有
-`run_fingerprint`（git commit + 未提交 diff + 实验参数）完全一致时才复用。
+`sweep_results.csv` 是追加式历史，每次成功尝试都保留一行；续跑时按配置名取
+最新一行判断是否可复用。只有 `run_fingerprint`（git commit + 未提交 diff +
+Python/依赖版本 + 实验参数）完全一致时才复用。
 如果模拟器或参数改过，旧行会自动重跑；`summary.md` 的排名和关键对照只使用
 当前源码+配置指纹匹配的行，“数据来源”表会标记每条结果的状态。
 
@@ -190,6 +195,9 @@ python   = Frontier/.venv/bin/python
 pending 标记会让下次续跑自动重试，并在汇总里标成“待重跑”，不会把旧行当新结果。
 同时固定发布路径 `outputs/.../<name>` 会撤到 `withdrawn/`，避免报告读到上一次结果；
 历史指标仍在 `attempts/` 中。
+
+重跑成功会向 `sweep_results.csv` 追加一条新尝试记录；失败不会删除或覆盖旧历史行。
+是否复用由 `pending` 和指纹决定，`current_results.csv` 始终只取最新匹配行。
 
 要强制重跑选中的配置（同一目录内其他 stage 的结果会保留）：
 
@@ -223,8 +231,9 @@ cd <path-to-Frontier>
 - `prefill_util` 用 `NA` 或 `[0,1]` 小数；
 - 400 请求 Poisson 用 `pois_g16_tp2_af4_qps250_n400`，不要拿 64 请求点代替。
 
-`current_results.csv` 只导出与本次源码和配置指纹匹配的结果，可直接用于
-`compare.py`；`sweep_results.csv` 保留历史行用于续跑和审计。缺测的利用率会写 `NA`。
+`current_results.csv` 只导出与本次源码、环境和配置指纹匹配的最新结果，可直接
+用于 `compare.py`；`sweep_results.csv` 按尝试追加、保留历史行用于审计。缺测的
+利用率会写 `NA`。
 只有 `simulation_metadata.total_requests` 和 `completed_requests` 都等于配置
 请求数时，该行才会写入成功结果；退出码为 0 但请求未跑完会记为失败。
 

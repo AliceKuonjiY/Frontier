@@ -47,6 +47,22 @@ PREFILL_TP="${PREFILL_TP:-8}"
 DECODE_ATTN_REPLICAS="${DECODE_ATTN_REPLICAS:-1}"
 DECODE_ATTN_TP="${DECODE_ATTN_TP:-8}"
 
+# Validate and normalize topology overrides before they reach CLI or Bash
+# arithmetic.  Leading zeros are accepted but converted to base 10.
+for topology_var in PREFILL_REPLICAS PREFILL_TP DECODE_ATTN_REPLICAS DECODE_ATTN_TP; do
+  topology_value="${!topology_var}"
+  if [[ ! "$topology_value" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: $topology_var must be a positive decimal integer, got '$topology_value'" >&2
+    exit 2
+  fi
+  topology_normalized=$((10#$topology_value))
+  if (( topology_normalized <= 0 )); then
+    echo "ERROR: $topology_var must be a positive decimal integer, got '$topology_value'" >&2
+    exit 2
+  fi
+  printf -v "$topology_var" '%d' "$topology_normalized"
+done
+
 cd "$REPO_ROOT"
 
 MODEL_JSON="data/config/models/Qwen3-4B.json"

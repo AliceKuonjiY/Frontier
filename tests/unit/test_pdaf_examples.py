@@ -386,6 +386,45 @@ def test_qwen3_4b_pdaf_allows_attention_replica_overrides(tmp_path: Path) -> Non
     assert _option_value(argv, "--cluster_config_decode_attn_replica_config_attn_tensor_parallel_size") == "1"
 
 
+def test_qwen3_4b_pdaf_normalizes_leading_zero_topology_overrides(
+    tmp_path: Path,
+) -> None:
+    argv = _capture_cli(
+        tmp_path,
+        "offline/qwen3_4b_pd_af.sh",
+        env_overrides={
+            "OUT_DIR": (tmp_path / "out").as_posix(),
+            "PREFILL_TP": "08",
+            "DECODE_ATTN_TP": "012",
+        },
+    )
+    assert _option_value(argv, "--cluster_config_prefill_replica_config_attn_tensor_parallel_size") == "8"
+    assert _option_value(argv, "--cluster_config_decode_attn_replica_config_attn_tensor_parallel_size") == "12"
+
+
+def test_qwen3_4b_pdaf_rejects_non_decimal_topology_override(
+    tmp_path: Path,
+) -> None:
+    env = os.environ.copy()
+    env.update(
+        {
+            "PYTHON_BIN": "/bin/true",
+            "OUT_DIR": (tmp_path / "out").as_posix(),
+            "PREFILL_TP": "08x",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "PREFILL_TP must be a positive decimal integer" in result.stderr
+
+
 def test_qwen3_4b_pdaf_uses_host_bounce_m2n_segment(tmp_path: Path) -> None:
     argv = _capture_cli(
         tmp_path,
