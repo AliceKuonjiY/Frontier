@@ -367,6 +367,25 @@ def test_qwen3_4b_pdaf_script_uses_network_device_template_for_weight_streaming(
     assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_streamed_ffn_layers") == "3"
 
 
+def test_qwen3_4b_pdaf_allows_attention_replica_overrides(tmp_path: Path) -> None:
+    argv = _capture_cli(
+        tmp_path,
+        "offline/qwen3_4b_pd_af.sh",
+        env_overrides={
+            "OUT_DIR": (tmp_path / "out").as_posix(),
+            "PREFILL_REPLICAS": "2",
+            "PREFILL_TP": "2",
+            "DECODE_ATTN_REPLICAS": "4",
+            "DECODE_ATTN_TP": "1",
+        },
+    )
+
+    assert _option_value(argv, "--cluster_config_prefill_cluster_num_replicas") == "2"
+    assert _option_value(argv, "--cluster_config_prefill_replica_config_attn_tensor_parallel_size") == "2"
+    assert _option_value(argv, "--cluster_config_decode_attn_cluster_num_replicas") == "4"
+    assert _option_value(argv, "--cluster_config_decode_attn_replica_config_attn_tensor_parallel_size") == "1"
+
+
 def test_qwen3_4b_pdaf_uses_host_bounce_m2n_segment(tmp_path: Path) -> None:
     argv = _capture_cli(
         tmp_path,

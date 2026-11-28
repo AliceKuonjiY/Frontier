@@ -18,6 +18,10 @@
 #       HostBounce single-segment effective bandwidth
 #   KV NVLink:  3172.5 Gbps, 0.0208 ms latency
 #   HPP2 ring:  2984 Gbps intra-node (373 GB/s), 0 latency
+#
+# Topology overrides:
+#   PREFILL_REPLICAS / PREFILL_TP        default 1 / 8
+#   DECODE_ATTN_REPLICAS / DECODE_ATTN_TP default 1 / 8
 
 set -euo pipefail
 
@@ -38,6 +42,10 @@ ARRIVAL_PATTERN="${ARRIVAL_PATTERN:-burst}"
 WEIGHT_STREAM_LAYERS="${WEIGHT_STREAM_LAYERS:-0}"
 AF_MICRO_BATCH="${AF_MICRO_BATCH:-1}"
 DECODE_ATTN_MICRO_BATCH_SIZE="${DECODE_ATTN_MICRO_BATCH_SIZE:-8}"
+PREFILL_REPLICAS="${PREFILL_REPLICAS:-1}"
+PREFILL_TP="${PREFILL_TP:-8}"
+DECODE_ATTN_REPLICAS="${DECODE_ATTN_REPLICAS:-1}"
+DECODE_ATTN_TP="${DECODE_ATTN_TP:-8}"
 
 cd "$REPO_ROOT"
 
@@ -117,19 +125,20 @@ CMD=(
   --sys_arch pd-af-disaggregation
   --no-enable_parallel_clusters
 
-  --cluster_config_prefill_cluster_num_replicas 1
-  --cluster_config_decode_attn_cluster_num_replicas 1
+  --cluster_config_prefill_cluster_num_replicas "$PREFILL_REPLICAS"
+  --cluster_config_decode_attn_cluster_num_replicas "$DECODE_ATTN_REPLICAS"
   --cluster_config_decode_ffn_cluster_num_replicas 1
 
   --cluster_config_decode_attn_af_pipeline_num_micro_batch "$AF_MICRO_BATCH"
   --cluster_config_decode_ffn_af_pipeline_num_micro_batch "$AF_MICRO_BATCH"
   --cluster_config_decode_attn_micro_batch_size "$DECODE_ATTN_MICRO_BATCH_SIZE"
 
-  # PREFILL: 8x H200, dense attention TP8.  The dense FFN follows attn TP8;
-  # moe_tp=8 only satisfies the shared role contract and is unused by a dense FFN.
+  # PREFILL: default 1 replica x TP8 = 8 H200.  The dense FFN follows
+  # attn TP; moe_tp only satisfies the shared role contract and is unused
+  # by a dense FFN.  Override with PREFILL_REPLICAS / PREFILL_TP.
   --cluster_config_prefill_replica_config_num_pipeline_stages 1
-  --cluster_config_prefill_replica_config_attn_tensor_parallel_size 8
-  --cluster_config_prefill_replica_config_moe_tensor_parallel_size 8
+  --cluster_config_prefill_replica_config_attn_tensor_parallel_size "$PREFILL_TP"
+  --cluster_config_prefill_replica_config_moe_tensor_parallel_size "$PREFILL_TP"
   --cluster_config_prefill_replica_config_moe_expert_parallel_size 1
   --cluster_config_prefill_replica_config_total_expert_num 1
   --cluster_config_prefill_replica_config_router_topk 1
@@ -137,9 +146,10 @@ CMD=(
   --cluster_config_prefill_replica_config_network_device h200_dgx
   --cluster_config_prefill_replica_config_memory_margin_fraction 0.2
 
-  # DECODE_ATTN: 8x H200, dense attention TP8.
+  # DECODE_ATTN: default 1 replica x TP8 = 8 H200.  Override with
+  # DECODE_ATTN_REPLICAS / DECODE_ATTN_TP.
   --cluster_config_decode_attn_replica_config_num_pipeline_stages 1
-  --cluster_config_decode_attn_replica_config_attn_tensor_parallel_size 8
+  --cluster_config_decode_attn_replica_config_attn_tensor_parallel_size "$DECODE_ATTN_TP"
   --cluster_config_decode_attn_replica_config_device h200
   --cluster_config_decode_attn_replica_config_network_device h200_dgx
   --cluster_config_decode_attn_replica_config_memory_margin_fraction 0.2
@@ -226,8 +236,8 @@ fi
 echo "========================================================="
 echo " Qwen3-4B PD-AF"
 echo " model: Qwen3-4B"
-echo " PREFILL:    h200 x8, attn TP8"
-echo " DECODE_ATTN:h200 x8, attn TP8"
+echo " PREFILL:    h200 x$((PREFILL_REPLICAS * PREFILL_TP)) (${PREFILL_REPLICAS}xTP${PREFILL_TP})"
+echo " DECODE_ATTN:h200 x$((DECODE_ATTN_REPLICAS * DECODE_ATTN_TP)) (${DECODE_ATTN_REPLICAS}xTP${DECODE_ATTN_TP})"
 echo " DECODE_FFN: hpp2 x8/16 ranks, FFN TP16"
 echo " requests:   $NUM_REQUESTS, prefill=$PREFILL_TOKENS, decode=$DECODE_TOKENS; $ARRIVAL_DESCRIPTION"
 echo " weight stream: $WEIGHT_STREAM_LAYERS layer(s) (0 = all resident)"
