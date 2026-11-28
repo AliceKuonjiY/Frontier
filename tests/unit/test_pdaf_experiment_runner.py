@@ -89,6 +89,29 @@ def test_extract_metrics_rejects_incomplete_requests(
         runner.extract_metrics(exp)
 
 
+def test_extract_metrics_rejects_error_statistics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exp = _experiment("verify_baseline_stream0")
+    base = tmp_path / exp.name
+    base.mkdir()
+    (base / "system_metrics.json").write_text(
+        json.dumps(
+            {
+                "simulation_metadata": {
+                    "total_requests": 8,
+                    "completed_requests": 8,
+                },
+                "ttft_statistics": {"error": "no samples"},
+            }
+        )
+    )
+    (base / "request_metrics.csv").write_text("Request Id\n")
+    monkeypatch.setattr(runner, "METRICS_ROOT", tmp_path)
+    with pytest.raises(runner.IncompleteRunError, match="ttft_statistics error"):
+        runner.extract_metrics(exp)
+
+
 def test_preflight_rejects_missing_streamed_cpu_overhead_table(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -138,6 +161,11 @@ def test_git_info_excludes_output_dir_from_status_and_diff(
     assert filtered["status_porcelain"] == ""
     assert filtered["diff_hash"] == baseline["diff_hash"]
     assert filtered["untracked_hash"] == baseline["untracked_hash"]
+
+
+def test_runtime_dependency_preflight_includes_plotly() -> None:
+    assert "plotly" in runner.RUNTIME_MODULES
+    assert "ddsketch" in runner.RUNTIME_MODULES
 
 
 def test_summary_handles_na_and_empty_numeric_fields(tmp_path: Path) -> None:
@@ -211,11 +239,13 @@ def test_build_command_passes_synthetic_seed() -> None:
         "--random_forrest_execution_time_predictor_config_num_training_job_threads"
     )
     assert cmd[idx + 1] == "1"
-    cmd = runner.build_command(exp, training_threads=2)
+    cmd = runner.build_command(exp, training_threads=2, cache_dir=Path("/tmp/cache"))
     idx = cmd.index(
         "--random_forrest_execution_time_predictor_config_num_training_job_threads"
     )
     assert cmd[idx + 1] == "2"
+    idx = cmd.index("--metrics_config_cache_dir")
+    assert cmd[idx + 1] == "/tmp/cache"
 
 
 def test_default_output_dirs_are_unique(
@@ -260,6 +290,32 @@ def test_run_one_terminates_if_cancel_arrives_during_spawn(
 
     assert (name, row, err) == ("g16_p8_d8_tp2", None, "cancelled")
     assert len(terminated) == 1
+
+
+def test_ensure_published_restores_matching_attempt(tmp_path: Path) -> None:
+    attempt_a = tmp_path / "attempts" / "a" / "metrics"
+    attempt_b = tmp_path / "attempts" / "b" / "metrics"
+    for attempt, value in ((attempt_a, "A"), (attempt_b, "B")):
+        attempt.mkdir(parents=True)
+        (attempt / "value.txt").write_text(value)
+    published = tmp_path / "published"
+    row_a = {
+        "metrics_dir": str(attempt_a),
+        "published_dir": str(published),
+        "run_fingerprint": "fp-a",
+    }
+    row_b = {
+        "metrics_dir": str(attempt_b),
+        "published_dir": str(published),
+        "run_fingerprint": "fp-b",
+    }
+
+    assert runner.ensure_published(row_b)
+    assert (published / "value.txt").read_text() == "B"
+    assert runner.ensure_published(row_a)
+    assert (published / "value.txt").read_text() == "A"
+    assert runner.published_matches(row_a)
+    assert not runner.published_matches(row_b)
 
 
 def test_withdraw_published_moves_fixed_metrics_path(

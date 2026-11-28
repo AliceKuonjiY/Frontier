@@ -52,6 +52,7 @@ Frontier/outputs/runs/<YYYYmmdd_HHMMSS>_<commit>/
 ├── summaries/<run_id>.md
 ├── commands/<run_id>.txt
 ├── attempts/<name>_<attempt>/   # 每次尝试独占；run.log / command.txt
+├── predictor_cache/<source_fp>/ # 按源码+环境隔离的预测模型缓存
 ├── withdrawn/                  # 待重跑时撤下的旧发布副本
 └── outputs/qwen3_4b/offline_batch/<name>/  # 校验成功后才发布
     ├── system_metrics.json
@@ -175,6 +176,10 @@ python   = Frontier/.venv/bin/python
 运行指纹同时包含 Python 版本/路径以及 scikit-learn、numpy、pandas、scipy
 版本；更换 `PYTHON_BIN` 或升级依赖后，旧结果不会被复用。
 
+预测模型缓存通过 `--metrics_config_cache_dir` 放在
+`predictor_cache/<source_fp>/`，同一源码/环境下的实验共享，源码或依赖变化后
+自动切换到新缓存目录，避免复跑读取旧模型。
+
 ## 5. 断点续跑
 
 默认每次运行都会新建 `outputs/runs/<时间戳>_<commit>/`，不会复用旧结果。  
@@ -185,9 +190,10 @@ python   = Frontier/.venv/bin/python
 ./run_experiments.sh --output-dir 20261128_101500_9e4fa41
 ```
 
-`sweep_results.csv` 是追加式历史，每次成功尝试都保留一行；续跑时按配置名取
-最新一行判断是否可复用。只有 `run_fingerprint`（git commit + 未提交 diff +
-Python/依赖版本 + 实验参数）完全一致时才复用。
+`sweep_results.csv` 是追加式历史，每次成功尝试都保留一行。续跑时按配置名
+查找最新一条 `run_fingerprint` 匹配当前源码/环境/参数的行；如果该行对应的
+`attempts/` 不是固定发布目录当前内容，会从 `attempts/` 重新发布并校验
+`publish_metadata.json`。只有指纹完全一致且发布目录可恢复时才复用。
 如果模拟器或参数改过，旧行会自动重跑；`summary.md` 的排名和关键对照只使用
 当前源码+配置指纹匹配的行，“数据来源”表会标记每条结果的状态。
 
@@ -236,6 +242,9 @@ cd <path-to-Frontier>
 利用率会写 `NA`。
 只有 `simulation_metadata.total_requests` 和 `completed_requests` 都等于配置
 请求数时，该行才会写入成功结果；退出码为 0 但请求未跑完会记为失败。
+`ttft_statistics` / `tpot_statistics` / `request_e2e_time_statistics` /
+`throughput_metrics` 出现 `error` 或缺少必需数值键时同样记为失败，不会写成 0；
+可选分位数缺测写 `NaN`。
 
 按 Ctrl-C 会取消排队任务、终止在跑子进程，按已写入的结果收尾，并以退出码
 `130` 返回；CSV 使用同目录临时文件原子替换，零结果时也会留下表头。
@@ -252,6 +261,10 @@ cd <path-to-Frontier>
 `PYTHON_BIN` 支持 PATH 中的命令名（如 `PYTHON_BIN=python3.11`）。
 脚本不再探测仓库父目录或共享 `/tmp` 下的 `.venv`；临时虚拟环境请通过
 `PYTHON_BIN=/path/to/python` 显式指定。
+
+Shell 探测和 Python 预检使用同一组运行时依赖：
+`ddsketch / fasteners / numpy / pandas / plotly / pyyaml / scikit-learn / scipy / tqdm`。
+缺少任意一项会在预检阶段直接报错。
 
 推荐在 `Frontier` 下建 uv 环境：
 

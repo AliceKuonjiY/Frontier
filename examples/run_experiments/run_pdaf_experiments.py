@@ -50,6 +50,7 @@ import argparse
 import concurrent.futures
 import csv
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -99,6 +100,18 @@ RESULTS_CSV = RUNS_ROOT / "_unset" / "sweep_results.csv"
 CANCEL_EVENT = threading.Event()
 _RUNNING_LOCK = threading.Lock()
 _RUNNING_PROCS: set[subprocess.Popen] = set()
+
+RUNTIME_MODULES = (
+    "ddsketch",
+    "fasteners",
+    "numpy",
+    "pandas",
+    "plotly",
+    "yaml",
+    "sklearn",
+    "scipy",
+    "tqdm",
+)
 
 REQUIRED_DATA = [
     "data/config/models/Qwen3-4B.json",
@@ -655,6 +668,7 @@ def build_command(
     exp: Experiment,
     metrics_output_dir: Path | None = None,
     training_threads: int = DEFAULT_TRAINING_THREADS,
+    cache_dir: Path | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -802,6 +816,8 @@ def build_command(
         # Metrics
         "--metrics_config_output_dir",
         str(metrics_output_dir or OUT_ROOT),
+        "--metrics_config_cache_dir",
+        str(cache_dir or (OUT_ROOT.parent / "predictor_cache")),
         "--metrics_config_run_id",
         exp.name,
         "--metrics_config_write_metrics",
@@ -884,16 +900,47 @@ def extract_metrics(
         requests = list(csv.DictReader(f))
 
     def mean_col(key: str) -> float:
-        vals = [float(r[key]) for r in requests if r.get(key) not in (None, "")]
+        vals: list[float] = []
+        for request in requests:
+            text = request.get(key)
+            if text in (None, ""):
+                continue
+            try:
+                value = float(text)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                vals.append(value)
         return sum(vals) / len(vals) if vals else float("nan")
 
-    ttft = system.get("ttft_statistics", {})
-    tpot = system.get("tpot_statistics", {})
-    e2e = system.get("request_e2e_time_statistics", {})
-    tp = system.get("throughput_metrics", {})
-    m2n = system.get("m2n_transfer_statistics", {})
-    kv = system.get("kv_cache_transfer_statistics", {})
-    af = system.get("af_pipeline_overlap_statistics", {})
+    def numeric(value: Any, label: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise IncompleteRunError(f"{label} is not numeric: {value!r}")
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise IncompleteRunError(f"{label} is not finite: {value!r}")
+        return parsed
+
+    def stat_section(name: str, required_keys: tuple[str, ...], required: bool) -> dict[str, Any]:
+        section = system.get(name)
+        if not isinstance(section, dict):
+            if required:
+                raise IncompleteRunError(f"{name} missing")
+            return {}
+        if "error" in section:
+            if required:
+                raise IncompleteRunError(f"{name} error: {section.get('error')}")
+            return {}
+        for key in required_keys:
+            numeric(section.get(key), f"{name}.{key}")
+        return section
+
+    def stat(section: dict[str, Any], key: str) -> float:
+        try:
+            return numeric(section.get(key), key)
+        except IncompleteRunError:
+            return float("nan")
+
     sim = system.get("simulation_metadata", {})
     preempt = system.get("preemption_statistics", {})
 
@@ -913,6 +960,24 @@ def extract_metrics(
         raise IncompleteRunError(
             f"completed {completed_requests}/{exp.num_req} requests"
         )
+
+    ttft = stat_section("ttft_statistics", ("mean",), required=True)
+    tpot_required = exp.decode_tokens > 1
+    tpot = stat_section("tpot_statistics", ("mean",), required=tpot_required)
+    e2e = stat_section("request_e2e_time_statistics", ("mean",), required=True)
+    tp = stat_section(
+        "throughput_metrics",
+        (
+            "total_duration_ms",
+            "requests_per_second",
+            "tokens_per_second",
+            "decode_tokens_per_second",
+        ),
+        required=True,
+    )
+    m2n = system.get("m2n_transfer_statistics", {})
+    kv = system.get("kv_cache_transfer_statistics", {})
+    af = system.get("af_pipeline_overlap_statistics", {})
 
     # 当前 PD-AF 输出没有 cluster_utilization 字段，缺测写 NaN，不写假 0。
     util = system.get("cluster_utilization", system.get("utilization_metrics", {}))
@@ -947,8 +1012,11 @@ def extract_metrics(
             float("nan"),
         )
 
-    makespan_ms = float(tp.get("total_duration_ms", 0.0) or 0.0)
-    out_tps = float(tp.get("decode_tokens_per_second", 0.0))
+    makespan_ms = numeric(tp.get("total_duration_ms"), "throughput_metrics.total_duration_ms")
+    out_tps = numeric(
+        tp.get("decode_tokens_per_second"),
+        "throughput_metrics.decode_tokens_per_second",
+    )
     row = asdict(exp)
     row.update(
         {
@@ -959,19 +1027,19 @@ def extract_metrics(
             "p_card_ratio": round(exp.p_card_ratio, 4),
             "effective_prefill_max_tokens": effective_prefill_max,
             "effective_decode_attn_max_tokens": effective_decode_attn_max,
-            "ttft_mean_ms": float(ttft.get("mean", 0.0)),
-            "ttft_p50_ms": float(ttft.get("p50", 0.0)),
-            "ttft_p90_ms": float(ttft.get("p90", 0.0)),
-            "ttft_p99_ms": float(ttft.get("p99", 0.0)),
-            "tpot_mean_ms": float(tpot.get("mean", 0.0)),
-            "tpot_p50_ms": float(tpot.get("p50", 0.0)),
-            "tpot_p90_ms": float(tpot.get("p90", 0.0)),
-            "tpot_p99_ms": float(tpot.get("p99", 0.0)),
-            "e2e_mean_ms": float(e2e.get("mean", 0.0)),
-            "e2e_p90_ms": float(e2e.get("p90", 0.0)),
-            "e2e_max_ms": float(e2e.get("max", 0.0)),
-            "requests_per_second": float(tp.get("requests_per_second", 0.0)),
-            "tokens_per_second": float(tp.get("tokens_per_second", 0.0)),
+            "ttft_mean_ms": stat(ttft, "mean"),
+            "ttft_p50_ms": stat(ttft, "p50"),
+            "ttft_p90_ms": stat(ttft, "p90"),
+            "ttft_p99_ms": stat(ttft, "p99"),
+            "tpot_mean_ms": stat(tpot, "mean"),
+            "tpot_p50_ms": stat(tpot, "p50"),
+            "tpot_p90_ms": stat(tpot, "p90"),
+            "tpot_p99_ms": stat(tpot, "p99"),
+            "e2e_mean_ms": stat(e2e, "mean"),
+            "e2e_p90_ms": stat(e2e, "p90"),
+            "e2e_max_ms": stat(e2e, "max"),
+            "requests_per_second": stat(tp, "requests_per_second"),
+            "tokens_per_second": stat(tp, "tokens_per_second"),
             "decode_tokens_per_second": out_tps,
             "decode_tps_per_gpu": out_tps / exp.h200_total_cards if exp.h200_total_cards else float("nan"),
             "total_duration_ms": makespan_ms,
@@ -1036,6 +1104,51 @@ def _terminate_all() -> None:
         _terminate_proc(proc)
 
 
+def write_publish_marker(row: dict[str, Any]) -> None:
+    dst = Path(row["published_dir"])
+    dst.mkdir(parents=True, exist_ok=True)
+    (dst / "publish_metadata.json").write_text(
+        json.dumps(
+            {
+                "attempt_dir": row.get("metrics_dir"),
+                "run_fingerprint": row.get("run_fingerprint"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def published_matches(row: dict[str, Any]) -> bool:
+    dst = Path(row.get("published_dir", ""))
+    meta_path = dst / "publish_metadata.json"
+    if not meta_path.is_file():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        meta.get("attempt_dir") == row.get("metrics_dir")
+        and meta.get("run_fingerprint") == row.get("run_fingerprint")
+    )
+
+
+def ensure_published(row: dict[str, Any]) -> bool:
+    if published_matches(row):
+        return True
+    src = Path(row.get("metrics_dir", ""))
+    dst = Path(row.get("published_dir", ""))
+    if not row or not src.is_dir() or not str(dst):
+        return False
+    try:
+        publish_metrics(src, dst)
+        write_publish_marker(row)
+    except Exception:
+        return False
+    return True
+
+
 def withdraw_published(exp: Experiment, output_dir: Path) -> None:
     """Remove the stable published copy while a rerun is pending.
 
@@ -1090,6 +1203,7 @@ def run_one(
     run_fp: str,
     output_dir: Path,
     training_threads: int = DEFAULT_TRAINING_THREADS,
+    cache_dir: Path | None = None,
 ) -> tuple[str, dict[str, Any] | None, str | None, float]:
     if CANCEL_EVENT.is_set():
         return exp.name, None, "cancelled", 0.0
@@ -1119,7 +1233,7 @@ def run_one(
     env.setdefault("OMP_NUM_THREADS", "2")
     env.setdefault("OPENBLAS_NUM_THREADS", "2")
 
-    cmd = build_command(exp, attempt_root, training_threads)
+    cmd = build_command(exp, attempt_root, training_threads, cache_dir)
     (attempt_root / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
     t0 = time.time()
     popen_kwargs: dict[str, Any] = {}
@@ -1193,6 +1307,7 @@ def run_one(
     row["attempt_dir"] = str(attempt_root)
     row["metrics_dir"] = str(attempt_result_dir)
     row["published_dir"] = str(canonical_dir)
+    row["predictor_cache_dir"] = str(cache_dir) if cache_dir else ""
     row["log_path"] = str(log_path)
     row["wall_seconds"] = elapsed
     return exp.name, row, None, elapsed
@@ -1326,6 +1441,16 @@ def config_fingerprint(exp: Experiment) -> str:
 def run_fingerprint(exp: Experiment, source: dict[str, Any]) -> str:
     payload = json.dumps(
         {"source": source, "config": asdict(exp)},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return _sha256_text(payload)
+
+
+def source_fingerprint(source: dict[str, Any]) -> str:
+    payload = json.dumps(
+        source,
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),
@@ -1775,6 +1900,12 @@ class OutputDirLock:
         self._fh = None
         self._locked = False
 
+    def __enter__(self) -> "OutputDirLock":
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
     def acquire(self) -> "OutputDirLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = self.path.open("a+", encoding="utf-8")
@@ -1875,13 +2006,14 @@ def preflight(selection_label: str, stages: set[str], selected: list[Experiment]
             f"缺少流式 CPU-overhead 表：{rel}（配置：{', '.join(names[:4])}"
             f"{' 等' if len(names) > 4 else ''}）"
         )
-    try:
-        import sklearn  # noqa: F401
-        import pandas  # noqa: F401
-        import numpy  # noqa: F401
-        import scipy  # noqa: F401
-    except Exception as exc:  # pragma: no cover - 环境检查
-        errors.append(f"当前 Python 缺少依赖：{exc!r}")
+    missing_modules: list[str] = []
+    for module_name in RUNTIME_MODULES:
+        try:
+            importlib.import_module(module_name)
+        except Exception as exc:  # pragma: no cover - 环境检查
+            missing_modules.append(f"{module_name} ({exc.__class__.__name__})")
+    if missing_modules:
+        errors.append("当前 Python 缺少运行时依赖：" + ", ".join(missing_modules))
 
     if errors:
         print("预检失败：", file=sys.stderr)
@@ -2043,11 +2175,14 @@ def main() -> int:
         OUT_ROOT = preview_dir / "outputs"
         METRICS_ROOT = OUT_ROOT / "qwen3_4b" / "offline_batch"
         RESULTS_CSV = preview_dir / "sweep_results.csv"
+        preview_cache = preview_dir / "predictor_cache" / source_fingerprint(
+            current_source()
+        )
         print(f"\n将执行 {len(selected)} 个配置（dry-run，不创建目录）：")
         for c in selected:
             print(f"  {c.name}")
         print("\n第一条命令：")
-        print(" ".join(build_command(selected[0])))
+        print(" ".join(build_command(selected[0], cache_dir=preview_cache)))
         return 0
 
     output_dir = resolve_output_dir(args.output_dir, create=True)
@@ -2065,289 +2200,327 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n等待目录锁时收到 Ctrl-C，退出。", file=sys.stderr)
         return 130
-    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-    run_manifest_path = output_dir / "manifests" / f"{run_id}.json"
-    run_summary_path = output_dir / "summaries" / f"{run_id}.md"
-    run_commands_path = output_dir / "commands" / f"{run_id}.txt"
-    pending_dir = output_dir / "pending"
-    for parent in (
-        run_manifest_path.parent,
-        run_summary_path.parent,
-        run_commands_path.parent,
-        pending_dir,
-    ):
-        parent.mkdir(parents=True, exist_ok=True)
-
-    def pending_path(exp: Experiment) -> Path:
-        return pending_dir / f"{exp.name}.json"
-
-    # Results are reusable only when both the experiment config and the
-    # working-tree identity match.  A new commit or an uncommitted simulator
-    # edit must not silently inherit an older row.
-    CANCEL_EVENT.clear()
-    git = git_info(exclude_paths=[output_dir])
-    source = current_source(git, exclude_paths=[output_dir])
-    all_cfgs = build_all_configs()
-    all_run_fps = {c.name: run_fingerprint(c, source) for c in all_cfgs}
-    config_fps = {c.name: config_fingerprint(c) for c in selected}
-    run_fps = {c.name: all_run_fps[c.name] for c in selected}
-
-    history_rows = load_existing_rows(RESULTS_CSV)
-    rows_by_name: dict[str, dict[str, Any]] = latest_by_name(history_rows)
-    current_by_name: dict[str, dict[str, Any]] = {}
-    for existing_row in history_rows:
-        if existing_row.get("run_fingerprint") == all_run_fps.get(existing_row["name"]):
-            current_by_name[existing_row["name"]] = existing_row
-
-    def cache_state(exp: Experiment) -> str:
-        if pending_path(exp).exists():
-            return "pending"
-        if exp.name in current_by_name:
-            return "current"
-        return "stale" if exp.name in rows_by_name else "missing"
-
-    stale = [c for c in selected if cache_state(c) == "stale"]
-    to_run = [c for c in selected if args.force or cache_state(c) != "current"]
-
-    manifest: dict[str, Any] = {
-        "started_at": datetime.now().isoformat(timespec="seconds"),
-        "finished_at": None,
-        "run_id": run_id,
-        "run_manifest": str(run_manifest_path),
-        "run_summary": str(run_summary_path),
-        "run_commands": str(run_commands_path),
-        "profile": None if selection_mode != "profile" else args.profile,
-        "profile_requested": args.profile,
-        "selection_mode": selection_mode,
-        "selection_label": selection_label,
-        "suite": args.suite,
-        "stage_filters": list(args.stage),
-        "name_filters": list(args.name),
-        "include_experimental": bool(args.include_experimental),
-        "force": bool(args.force),
-        "stages": sorted(stages),
-        "workers": args.workers,
-        "training_threads": args.training_threads,
-        "timeout_s": args.timeout,
-        "python": sys.executable,
-        "python_version": platform.python_version(),
-        "platform": platform.platform(),
-        "repo_root": str(REPO_ROOT),
-        "output_dir": str(output_dir),
-        "git": git,
-        "source": source,
-        "current_fingerprints": all_run_fps,
-        "num_selected": len(selected),
-        "num_run": len(to_run),
-        "num_cached": len(selected) - len(to_run),
-        "num_stale": 0 if args.force else len(stale),
-        "pending": [],
-        "num_pending": 0,
-        "num_ok": 0,
-        "num_failed": 0,
-        "num_cancelled": 0,
-        "interrupted": False,
-        "failures": [],
-        "experiments": [
-            {
-                **asdict(c),
-                "config_fingerprint": config_fps[c.name],
-                "run_fingerprint": run_fps[c.name],
-            }
-            for c in selected
-        ],
-    }
-    manifest_path = output_dir / "manifest.json"
-    manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
-    manifest_path.write_text(manifest_text, encoding="utf-8")
-    run_manifest_path.write_text(manifest_text, encoding="utf-8")
-    commands_text = "\n\n".join(
-        " ".join(build_command(c, training_threads=args.training_threads))
-        for c in selected
-    )
-    (output_dir / "commands.txt").write_text(commands_text, encoding="utf-8")
-    run_commands_path.write_text(commands_text, encoding="utf-8")
-
-    def preferred_row(name: str) -> dict[str, Any] | None:
-        return current_by_name.get(name) or rows_by_name.get(name)
-
-    def ordered_rows() -> list[dict[str, Any]]:
-        ordered = [
-            preferred_row(c.name)
-            for c in selected
-            if preferred_row(c.name) is not None
-        ]
-        seen = {row["name"] for row in ordered}
-        for name in rows_by_name:
-            if name not in seen:
-                row = preferred_row(name)
-                if row is not None:
-                    ordered.append(row)
-        return ordered
-
-    def current_rows_now() -> list[dict[str, Any]]:
-        pending = {p.stem for p in pending_dir.glob("*.json")}
-        return [
-            r for r in current_by_name.values()
-            if r["name"] not in pending
-        ]
-
-    print()
-    print(f"输出目录 : {output_dir}")
-    print(f"配置数   : {len(selected)}（缓存 {len(selected) - len(to_run)}，待跑 {len(to_run)}）")
-    if stale and not args.force:
-        print(f"旧结果   : {len(stale)} 个源码/配置指纹不匹配，将重跑")
-    pending_before = [c for c in selected if pending_path(c).exists()]
-    if pending_before:
-        print(f"待重跑   : {len(pending_before)} 个上次中断/失败未完成")
-    print(f"workers  : {args.workers}")
-    print()
-
-    failures: list[tuple[str, str]] = []
-    ok_names: set[str] = set()
-    done = 0
-    interrupted = False
-    # Mark every selected attempt before launching it.  If this process is
-    # interrupted or dies, the old row is not treated as current on the next
-    # resume; the run is retried instead.
-    for exp in to_run:
-        pending_path(exp).write_text(
-            json.dumps(
-                {"run_fingerprint": run_fps[exp.name], "run_id": run_id},
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        withdraw_published(exp, output_dir)
-
-    # Withdraw stale current-source rows immediately; report scripts must not
-    # keep reading the previous current_results.csv while reruns are pending.
-    save_csv(current_rows_now(), current_csv)
-
-    t_start = time.time()
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
-    futures = {
-        pool.submit(
-            run_one,
-            c,
-            args.timeout,
-            source,
-            run_fps[c.name],
-            output_dir,
-            args.training_threads,
-        ): c
-        for c in to_run
-    }
     try:
-        for future in concurrent.futures.as_completed(futures):
-            done += 1
-            exp = futures[future]
-            try:
-                name, row, err, elapsed = future.result()
-            except Exception as exc:  # noqa: BLE001 - report worker crash
-                name, row, err, elapsed = exp.name, None, f"worker crashed: {exc}", 0.0
-            if not err:
-                # Publishing on the main thread closes the Ctrl-C window where
-                # a worker had already written the fixed metrics path but the
-                # pending marker and CSV were never updated.
-                if current_source(exclude_paths=[output_dir]) != source:
-                    err = "source changed before publish; result rejected"
-                else:
-                    try:
-                        publish_metrics(
-                            Path(row["metrics_dir"]),
-                            Path(row["published_dir"]),
-                        )
-                    except Exception as exc:  # noqa: BLE001 - report as failure
-                        err = f"publish failed: {exc}"
-                if not err and current_source(exclude_paths=[output_dir]) != source:
-                    withdraw_published(exp, output_dir)
-                    err = "source changed during publish; result rejected"
-            if err:
-                failures.append((name, err))
-                withdraw_published(exp, output_dir)
-                print(f"[{done}/{len(to_run)}] FAIL {name}: {err} ({elapsed}s)", flush=True)
-            else:
-                rows_by_name[name] = row
-                current_by_name[name] = row
-                history_rows.append(row)
-                ok_names.add(name)
-                save_csv(history_rows, RESULTS_CSV)
-                pending_path(exp).unlink(missing_ok=True)
-                print(
-                    f"[{done}/{len(to_run)}] OK   {name:46s} ({elapsed:6.1f}s) | "
-                    f"TTFT={row['ttft_mean_ms']:7.2f}ms TPOT={row['tpot_mean_ms']:6.3f}ms "
-                    f"E2E={row['e2e_mean_ms']:7.1f}ms out_tps={row['decode_tokens_per_second']:8.0f}",
-                    flush=True,
-                )
-    except KeyboardInterrupt:
-        interrupted = True
-        print(
-            "\n收到 Ctrl-C：取消排队任务、终止在跑仿真，并保存已完成结果。",
-            file=sys.stderr,
-        )
-        CANCEL_EVENT.set()
-        for future in futures:
-            future.cancel()
-        _terminate_all()
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+        run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+        run_manifest_path = output_dir / "manifests" / f"{run_id}.json"
+        run_summary_path = output_dir / "summaries" / f"{run_id}.md"
+        run_commands_path = output_dir / "commands" / f"{run_id}.txt"
+        pending_dir = output_dir / "pending"
+        for parent in (
+            run_manifest_path.parent,
+            run_summary_path.parent,
+            run_commands_path.parent,
+            pending_dir,
+        ):
+            parent.mkdir(parents=True, exist_ok=True)
 
-    # A pending case must never leave a published fixed path behind, including
-    # results that finished in a worker while the main loop was interrupted.
-    for exp in selected:
-        if pending_path(exp).exists():
+        def pending_path(exp: Experiment) -> Path:
+            return pending_dir / f"{exp.name}.json"
+
+        # Results are reusable only when both the experiment config and the
+        # working-tree identity match.  A new commit or an uncommitted simulator
+        # edit must not silently inherit an older row.
+        CANCEL_EVENT.clear()
+        git = git_info(exclude_paths=[output_dir])
+        source = current_source(git, exclude_paths=[output_dir])
+        source_fp = source_fingerprint(source)
+        predictor_cache_dir = output_dir / "predictor_cache" / source_fp
+        predictor_cache_dir.mkdir(parents=True, exist_ok=True)
+        all_cfgs = build_all_configs()
+        all_run_fps = {c.name: run_fingerprint(c, source) for c in all_cfgs}
+        config_fps = {c.name: config_fingerprint(c) for c in selected}
+        run_fps = {c.name: all_run_fps[c.name] for c in selected}
+
+        history_rows = load_existing_rows(RESULTS_CSV)
+        rows_by_name: dict[str, dict[str, Any]] = latest_by_name(history_rows)
+        current_by_name: dict[str, dict[str, Any]] = {}
+        for existing_row in history_rows:
+            if existing_row.get("run_fingerprint") == all_run_fps.get(existing_row["name"]):
+                current_by_name[existing_row["name"]] = existing_row
+
+        # The fixed published path may belong to another source snapshot after
+        # switching A -> B -> A.  Restore it from the matching immutable attempt.
+        pending_now = {p.stem for p in pending_dir.glob("*.json")}
+        for name in list(current_by_name):
+            if name in pending_now:
+                continue
+            if not ensure_published(current_by_name[name]):
+                del current_by_name[name]
+
+        # Withdraw published copies whose source does not match the current
+        # snapshot; they remain recoverable from attempts/ if the source returns.
+        cfg_by_name = {c.name: c for c in all_cfgs}
+        for name in rows_by_name:
+            if name in current_by_name or name in pending_now:
+                continue
+            exp = cfg_by_name.get(name)
+            if exp is not None:
+                withdraw_published(exp, output_dir)
+
+        def cache_state(exp: Experiment) -> str:
+            if pending_path(exp).exists():
+                return "pending"
+            if exp.name in current_by_name:
+                return "current"
+            return "stale" if exp.name in rows_by_name else "missing"
+
+        stale = [c for c in selected if cache_state(c) == "stale"]
+        to_run = [c for c in selected if args.force or cache_state(c) != "current"]
+
+        manifest: dict[str, Any] = {
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "run_id": run_id,
+            "run_manifest": str(run_manifest_path),
+            "run_summary": str(run_summary_path),
+            "run_commands": str(run_commands_path),
+            "profile": None if selection_mode != "profile" else args.profile,
+            "profile_requested": args.profile,
+            "selection_mode": selection_mode,
+            "selection_label": selection_label,
+            "suite": args.suite,
+            "stage_filters": list(args.stage),
+            "name_filters": list(args.name),
+            "include_experimental": bool(args.include_experimental),
+            "force": bool(args.force),
+            "stages": sorted(stages),
+            "workers": args.workers,
+            "training_threads": args.training_threads,
+            "timeout_s": args.timeout,
+            "python": sys.executable,
+            "python_version": platform.python_version(),
+            "platform": platform.platform(),
+            "repo_root": str(REPO_ROOT),
+            "output_dir": str(output_dir),
+            "git": git,
+            "source": source,
+            "source_fingerprint": source_fp,
+            "predictor_cache_dir": str(predictor_cache_dir),
+            "current_fingerprints": all_run_fps,
+            "num_selected": len(selected),
+            "num_run": len(to_run),
+            "num_cached": len(selected) - len(to_run),
+            "num_stale": 0 if args.force else len(stale),
+            "pending": [],
+            "num_pending": 0,
+            "num_ok": 0,
+            "num_failed": 0,
+            "num_cancelled": 0,
+            "interrupted": False,
+            "failures": [],
+            "experiments": [
+                {
+                    **asdict(c),
+                    "config_fingerprint": config_fps[c.name],
+                    "run_fingerprint": run_fps[c.name],
+                }
+                for c in selected
+            ],
+        }
+        manifest_path = output_dir / "manifest.json"
+        manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
+        manifest_path.write_text(manifest_text, encoding="utf-8")
+        run_manifest_path.write_text(manifest_text, encoding="utf-8")
+        commands_text = "\n\n".join(
+            " ".join(
+                build_command(
+                    c,
+                    training_threads=args.training_threads,
+                    cache_dir=predictor_cache_dir,
+                )
+            )
+            for c in selected
+        )
+        (output_dir / "commands.txt").write_text(commands_text, encoding="utf-8")
+        run_commands_path.write_text(commands_text, encoding="utf-8")
+
+        def preferred_row(name: str) -> dict[str, Any] | None:
+            return current_by_name.get(name) or rows_by_name.get(name)
+
+        def ordered_rows() -> list[dict[str, Any]]:
+            ordered = [
+                preferred_row(c.name)
+                for c in selected
+                if preferred_row(c.name) is not None
+            ]
+            seen = {row["name"] for row in ordered}
+            for name in rows_by_name:
+                if name not in seen:
+                    row = preferred_row(name)
+                    if row is not None:
+                        ordered.append(row)
+            return ordered
+
+        def current_rows_now() -> list[dict[str, Any]]:
+            pending = {p.stem for p in pending_dir.glob("*.json")}
+            return [
+                r for r in current_by_name.values()
+                if r["name"] not in pending
+            ]
+
+        print()
+        print(f"输出目录 : {output_dir}")
+        print(f"配置数   : {len(selected)}（缓存 {len(selected) - len(to_run)}，待跑 {len(to_run)}）")
+        if stale and not args.force:
+            print(f"旧结果   : {len(stale)} 个源码/配置指纹不匹配，将重跑")
+        pending_before = [c for c in selected if pending_path(c).exists()]
+        if pending_before:
+            print(f"待重跑   : {len(pending_before)} 个上次中断/失败未完成")
+        print(f"workers  : {args.workers}")
+        print()
+
+        failures: list[tuple[str, str]] = []
+        ok_names: set[str] = set()
+        done = 0
+        interrupted = False
+        # Mark every selected attempt before launching it.  If this process is
+        # interrupted or dies, the old row is not treated as current on the next
+        # resume; the run is retried instead.
+        for exp in to_run:
+            pending_path(exp).write_text(
+                json.dumps(
+                    {"run_fingerprint": run_fps[exp.name], "run_id": run_id},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             withdraw_published(exp, output_dir)
 
-    ordered = ordered_rows()
-    save_csv(history_rows, RESULTS_CSV)
-    pending_names = sorted(p.stem for p in pending_dir.glob("*.json"))
-    pending_set = set(pending_names)
-    current_rows = current_rows_now()
-    save_csv(current_rows, current_csv)
+        # Withdraw stale current-source rows immediately; report scripts must not
+        # keep reading the previous current_results.csv while reruns are pending.
+        save_csv(current_rows_now(), current_csv)
 
-    num_cancelled = max(0, len(to_run) - len(ok_names) - len(failures))
-    manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
-    manifest["num_ok"] = len(ok_names)
-    manifest["num_failed"] = len(failures)
-    manifest["num_cancelled"] = num_cancelled if interrupted else 0
-    manifest["interrupted"] = interrupted
-    manifest["num_results"] = len(ordered)
-    manifest["num_attempts"] = len(history_rows)
-    manifest["num_current_results"] = len(current_rows)
-    manifest["pending"] = pending_names
-    manifest["num_pending"] = len(pending_names)
-    manifest["current_results_csv"] = str(current_csv)
-    manifest["failures"] = [{"name": n, "error": e} for n, e in failures]
-    manifest["elapsed_s"] = round(time.time() - t_start, 1)
-    manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
-    manifest_path.write_text(manifest_text, encoding="utf-8")
-    run_manifest_path.write_text(manifest_text, encoding="utf-8")
+        t_start = time.time()
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
+        futures: dict[concurrent.futures.Future, Experiment] = {}
+        try:
+            # Keep submission inside the interrupt handler and register every
+            # future incrementally.  Ctrl-C during submission must still cancel
+            # queued work and terminate already-started children.
+            for c in to_run:
+                future = pool.submit(
+                    run_one,
+                    c,
+                    args.timeout,
+                    source,
+                    run_fps[c.name],
+                    output_dir,
+                    args.training_threads,
+                    predictor_cache_dir,
+                )
+                futures[future] = c
+            for future in concurrent.futures.as_completed(futures):
+                done += 1
+                exp = futures[future]
+                try:
+                    name, row, err, elapsed = future.result()
+                except Exception as exc:  # noqa: BLE001 - report worker crash
+                    name, row, err, elapsed = exp.name, None, f"worker crashed: {exc}", 0.0
+                if not err:
+                    # Publishing on the main thread closes the Ctrl-C window where
+                    # a worker had already written the fixed metrics path but the
+                    # pending marker and CSV were never updated.
+                    if current_source(exclude_paths=[output_dir]) != source:
+                        err = "source changed before publish; result rejected"
+                    else:
+                        try:
+                            publish_metrics(
+                                Path(row["metrics_dir"]),
+                                Path(row["published_dir"]),
+                            )
+                            write_publish_marker(row)
+                        except Exception as exc:  # noqa: BLE001 - report as failure
+                            err = f"publish failed: {exc}"
+                    if not err and current_source(exclude_paths=[output_dir]) != source:
+                        withdraw_published(exp, output_dir)
+                        err = "source changed during publish; result rejected"
+                if err:
+                    failures.append((name, err))
+                    withdraw_published(exp, output_dir)
+                    print(f"[{done}/{len(to_run)}] FAIL {name}: {err} ({elapsed}s)", flush=True)
+                else:
+                    rows_by_name[name] = row
+                    current_by_name[name] = row
+                    history_rows.append(row)
+                    ok_names.add(name)
+                    save_csv(history_rows, RESULTS_CSV)
+                    pending_path(exp).unlink(missing_ok=True)
+                    print(
+                        f"[{done}/{len(to_run)}] OK   {name:46s} ({elapsed:6.1f}s) | "
+                        f"TTFT={row['ttft_mean_ms']:7.2f}ms TPOT={row['tpot_mean_ms']:6.3f}ms "
+                        f"E2E={row['e2e_mean_ms']:7.1f}ms out_tps={row['decode_tokens_per_second']:8.0f}",
+                        flush=True,
+                    )
+        except KeyboardInterrupt:
+            interrupted = True
+            print(
+                "\n收到 Ctrl-C：取消排队任务、终止在跑仿真，并保存已完成结果。",
+                file=sys.stderr,
+            )
+            CANCEL_EVENT.set()
+            for future in futures:
+                future.cancel()
+            _terminate_all()
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
-    summary_path = output_dir / "summary.md"
-    write_summary(ordered, summary_path, manifest, failures)
-    write_summary(ordered, run_summary_path, manifest, failures)
+        # A pending case must never leave a published fixed path behind, including
+        # results that finished in a worker while the main loop was interrupted.
+        for exp in selected:
+            if pending_path(exp).exists():
+                withdraw_published(exp, output_dir)
 
-    print()
-    print(
-        f"完成：本次运行 {len(ok_names)} 成功，{len(failures)} 失败，"
-        f"{manifest['num_cancelled']} 取消；"
-        f"目录共 {len(ordered)} 条结果（缓存 {len(selected) - len(to_run)}）"
-    )
-    print(f"全部结果 : {RESULTS_CSV}")
-    print(f"当前源码 : {current_csv}")
-    print(f"汇总报告 : {summary_path}")
-    print(f"运行清单 : {manifest_path}")
-    lock.release()
-    if interrupted:
-        return 130
-    if failures:
-        print("\n失败列表：")
-        for name, err in failures:
-            print(f"  - {name}: {err}")
-        return 1
-    return 0
+        ordered = ordered_rows()
+        save_csv(history_rows, RESULTS_CSV)
+        pending_names = sorted(p.stem for p in pending_dir.glob("*.json"))
+        pending_set = set(pending_names)
+        current_rows = current_rows_now()
+        save_csv(current_rows, current_csv)
 
+        num_cancelled = max(0, len(to_run) - len(ok_names) - len(failures))
+        manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        manifest["num_ok"] = len(ok_names)
+        manifest["num_failed"] = len(failures)
+        manifest["num_cancelled"] = num_cancelled if interrupted else 0
+        manifest["interrupted"] = interrupted
+        manifest["num_results"] = len(ordered)
+        manifest["num_attempts"] = len(history_rows)
+        manifest["num_current_results"] = len(current_rows)
+        manifest["pending"] = pending_names
+        manifest["num_pending"] = len(pending_names)
+        manifest["current_results_csv"] = str(current_csv)
+        manifest["failures"] = [{"name": n, "error": e} for n, e in failures]
+        manifest["elapsed_s"] = round(time.time() - t_start, 1)
+        manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
+        manifest_path.write_text(manifest_text, encoding="utf-8")
+        run_manifest_path.write_text(manifest_text, encoding="utf-8")
+
+        summary_path = output_dir / "summary.md"
+        write_summary(ordered, summary_path, manifest, failures)
+        write_summary(ordered, run_summary_path, manifest, failures)
+
+        print()
+        print(
+            f"完成：本次运行 {len(ok_names)} 成功，{len(failures)} 失败，"
+            f"{manifest['num_cancelled']} 取消；"
+            f"目录共 {len(ordered)} 条结果（缓存 {len(selected) - len(to_run)}）"
+        )
+        print(f"全部结果 : {RESULTS_CSV}")
+        print(f"当前源码 : {current_csv}")
+        print(f"汇总报告 : {summary_path}")
+        print(f"运行清单 : {manifest_path}")
+        if interrupted:
+            return 130
+        if failures:
+            print("\n失败列表：")
+            for name, err in failures:
+                print(f"  - {name}: {err}")
+            return 1
+        return 0
+
+
+    finally:
+        lock.release()
 
 if __name__ == "__main__":
     raise SystemExit(main())

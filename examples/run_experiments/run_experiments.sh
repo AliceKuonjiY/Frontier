@@ -26,7 +26,7 @@ fi
 
 check_python() {
   local out
-  out="$("$1" -c 'import sys, sklearn, pandas, numpy, scipy; assert sys.version_info >= (3, 10); print("ok")' 2>/dev/null)" || return 1
+  out="$("$1" -c 'import sys, ddsketch, fasteners, numpy, pandas, plotly, yaml, sklearn, scipy, tqdm; assert sys.version_info >= (3, 10); print("ok")' 2>/dev/null)" || return 1
   [ "$out" = "ok" ]
 }
 
@@ -42,7 +42,7 @@ if [ -n "${PYTHON_BIN:-}" ]; then
     exit 2
   fi
   if ! check_python "$PY"; then
-    echo "ERROR: PYTHON_BIN=$PYTHON_BIN 缺少依赖（sklearn/pandas/numpy/scipy）" >&2
+    echo "ERROR: PYTHON_BIN=$PYTHON_BIN 缺少依赖（ddsketch/fasteners/numpy/pandas/plotly/yaml/sklearn/scipy/tqdm）" >&2
     exit 2
   fi
 else
