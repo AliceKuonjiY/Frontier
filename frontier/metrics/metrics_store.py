@@ -2426,11 +2426,14 @@ class MetricsStore:
             system_metrics["prefix_cache_statistics"] = prefix_cache_statistics
 
         # 7. KV Cache Transfer statistics (for disaggregated mode)
+        kv_transfer_profile = getattr(
+            self._simulation_config, "resolved_kv_cache_transfer_profile", None
+        )
         if self._kv_cache_transfer_metrics["transfer_count"] > 0:
             transfer_times = self._kv_cache_transfer_metrics["transfer_times"]
             if len(transfer_times) > 0:
                 transfer_time_values = [y for _, y in transfer_times._data_series]
-                system_metrics["kv_cache_transfer_statistics"] = {
+                kv_transfer_stats = {
                     "total_transfers": self._kv_cache_transfer_metrics[
                         "transfer_count"
                     ],
@@ -2444,6 +2447,9 @@ class MetricsStore:
                         transfer_time_values, "ms"
                     ),
                 }
+                if kv_transfer_profile is not None:
+                    kv_transfer_stats.update(kv_transfer_profile.to_metrics_dict())
+                system_metrics["kv_cache_transfer_statistics"] = kv_transfer_stats
                 system_metrics["kv_cache_transfer_total_bytes"] = (
                     self._kv_cache_transfer_metrics["total_data_transferred"]
                 )
@@ -2590,17 +2596,61 @@ class MetricsStore:
             "system_architecture": self._simulation_config.sys_arch,
             "cluster_configurations": {},
         }
+        if kv_transfer_profile is not None:
+            system_architecture_info["kv_cache_transfer_link"] = (
+                kv_transfer_profile.to_metrics_dict()
+            )
 
         model_weight_memory = {}
         for cluster_type, cluster_config in self._cluster_configs.items():
             try:
-                # Import ParamCounter for model weight calculations
+                from dataclasses import is_dataclass
+                from frontier.scheduler.utils.memory_planner import MemoryPlanner
+                from frontier.scheduler.utils.replica_config import (
+                    resolve_replica_scheduler_config,
+                )
+                from frontier.scheduler.utils.sram_budget import (
+                    build_memory_budget_metrics,
+                    resolve_sram_profile_contract_for_cluster,
+                )
                 from frontier.utils.param_counter import ParamCounter
 
-                # Create ParamCounter for this cluster configuration
                 param_counter = ParamCounter(
                     replica_config=cluster_config.replica_config,
                     cluster_type=cluster_type,
+                )
+                sram_profile_contract = resolve_sram_profile_contract_for_cluster(
+                    predictor_config=getattr(
+                        cluster_config, "execution_time_predictor_config", None
+                    ),
+                    replica_config=cluster_config.replica_config,
+                    cluster_type=cluster_type,
+                )
+                base_scheduler_config = getattr(
+                    cluster_config, "replica_scheduler_config", None
+                )
+                scheduler_config = (
+                    resolve_replica_scheduler_config(cluster_config, cluster_type)
+                    if is_dataclass(base_scheduler_config)
+                    else base_scheduler_config
+                )
+                planner_gpu_utilization = getattr(
+                    scheduler_config, "gpu_memory_utilization", None
+                )
+                planner_non_kv_overhead = (
+                    int(getattr(scheduler_config, "non_kv_cache_overhead_bytes", 0))
+                    if getattr(scheduler_config, "num_blocks_mode", "memory_planner")
+                    == "memory_planner_profiled"
+                    else 0
+                )
+                memory_budget = MemoryPlanner(
+                    replica_config=cluster_config.replica_config,
+                    replica=None,
+                    cluster_type=cluster_type,
+                    sram_profile_contract=sram_profile_contract,
+                ).get_memory_budget(
+                    gpu_memory_utilization=planner_gpu_utilization,
+                    non_kv_cache_overhead_bytes=planner_non_kv_overhead,
                 )
 
                 # Calculate model parameters and memory
@@ -2615,9 +2665,7 @@ class MetricsStore:
 
                 # Calculate memory in bytes.  Attention/MTP keep the 2-byte
                 # approximation; the MLP term follows the configured FP8 width.
-                model_weight_memory_bytes = (
-                    param_counter.get_parameter_memory_per_device_bytes()
-                )
+                model_weight_memory_bytes = memory_budget.resident_weight_bytes
                 model_weight_memory_gb = model_weight_memory_bytes / (1024**3)
 
                 # Calculate memory breakdown
@@ -2634,15 +2682,18 @@ class MetricsStore:
                     * num_mlp_params_per_device
                 ) - param_counter.get_streamed_ffn_weight_bytes_per_device()
 
-                # Calculate memory utilization percentage
+                # Default memory_utilization_percent uses resident_plus_buffer / usable.
                 total_device_memory_gb = (
                     cluster_config.replica_config.device_config.total_memory_gb
                 )
-                memory_utilization_percent = (
-                    (model_weight_memory_gb / total_device_memory_gb) * 100
-                    if total_device_memory_gb > 0
-                    else 0
+                memory_budget_payload = build_memory_budget_metrics(memory_budget)
+                nominal_memory_utilization_percent = (
+                    memory_budget.resident_plus_buffer_of_nominal_percent
                 )
+                usable_memory_utilization_percent = (
+                    memory_budget.resident_plus_buffer_of_usable_percent
+                )
+                memory_utilization_percent = usable_memory_utilization_percent
 
                 # Extract parallel parameters based on cluster type
                 replica_config = cluster_config.replica_config
@@ -2681,6 +2732,12 @@ class MetricsStore:
                     "total_memory_bytes": int(model_weight_memory_bytes),
                     "total_memory_gb": float(model_weight_memory_gb),
                     "memory_utilization_percent": float(memory_utilization_percent),
+                    "nominal_memory_utilization_percent": float(
+                        nominal_memory_utilization_percent
+                    ),
+                    "usable_memory_utilization_percent": float(
+                        usable_memory_utilization_percent
+                    ),
                     "breakdown": {
                         "attention_parameters": int(
                             num_attention_params_per_layer
@@ -2700,6 +2757,9 @@ class MetricsStore:
                     "device_info": {
                         "device_type": cluster_config.replica_config.device_config.get_type().name,
                         "total_device_memory_gb": float(total_device_memory_gb),
+                        "nominal_device_memory_mib": memory_budget_payload["nominal_memory_mib"],
+                        "usable_device_memory_mib": memory_budget_payload["usable_memory_mib"],
+                        "planning_overhead_mib": memory_budget_payload["planning_overhead_mib"],
                         "num_replicas": cluster_config.num_replicas,
                         "expert_parallel_size": getattr(
                             cluster_config.replica_config, "moe_expert_parallel_size", 1
@@ -2708,14 +2768,21 @@ class MetricsStore:
                             cluster_config.replica_config, "moe_tensor_parallel_size", 1
                         ),
                     },
+                    "memory_budget": memory_budget_payload,
                 }
+                if sram_profile_contract is not None:
+                    cluster_memory_info["profiling_sram_contract"] = (
+                        sram_profile_contract.to_metrics_dict()
+                    )
 
                 if cluster_type == ClusterType.DECODE_FFN:
                     cluster_memory_info["weight_residency"] = {
                         "streamed_ffn_layers": getattr(replica_config, "streamed_ffn_layers", 0),
                         "resident_weight_bytes": model_weight_memory_bytes,
                         "off_device_weight_bytes": param_counter.get_streamed_ffn_weight_bytes_per_device(),
-                        "planned_staging_buffer_bytes": param_counter.get_ffn_streaming_buffer_bytes_per_device(),
+                        "planned_staging_buffer_bytes": memory_budget.staging_buffer_bytes,
+                        "resident_plus_buffer_bytes": memory_budget.resident_plus_buffer_bytes,
+                        "reserved_with_overhead_bytes": memory_budget.reserved_with_overhead_bytes,
                         "measured_peak_bytes": None,
                     }
                 model_weight_memory[cluster_type.name] = cluster_memory_info

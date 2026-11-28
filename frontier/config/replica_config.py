@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Optional
 
-from frontier.config.device_sku_config import BaseDeviceSKUConfig
+from frontier.config.device_sku_config import (
+    BINARY_MIB_BYTES,
+    BaseDeviceSKUConfig,
+    validate_memory_mb_value,
+)
 from frontier.config.model_config import BaseModelConfig
 from frontier.config.node_sku_config import BaseNodeSKUConfig
 from frontier.config.speculative_decoding_config import (
@@ -116,6 +121,14 @@ class ReplicaConfig:
         default=0,
         metadata={"help": "Dense decode-FFN layers streamed through one temporary layer buffer."},
     )
+    usable_memory_mb: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional usable per-device memory budget in binary MiB (1024^2 bytes)."},
+    )
+    planning_overhead_mb: Optional[float] = field(
+        default=None,
+        metadata={"help": "Optional fixed per-device planning overhead in binary MiB (1024^2 bytes)."},
+    )
 
     def __post_init__(self):
         if type(self.attn_dp) is not int or self.attn_dp <= 0:
@@ -137,6 +150,19 @@ class ReplicaConfig:
         self.node_config: BaseNodeSKUConfig = BaseNodeSKUConfig.create_from_type_string(
             self.network_device
         )
+
+        if self.usable_memory_mb is not None:
+            self.usable_memory_mb = validate_memory_mb_value(
+                self.usable_memory_mb, "usable_memory_mb", allow_zero=False
+            )
+            if self.get_usable_memory_bytes() > self.get_nominal_memory_bytes():
+                raise ValueError("usable_memory_mb cannot exceed nominal device memory")
+        if self.planning_overhead_mb is not None:
+            self.planning_overhead_mb = validate_memory_mb_value(
+                self.planning_overhead_mb, "planning_overhead_mb", allow_zero=True
+            )
+        if self.get_planning_overhead_bytes() >= self.get_usable_memory_bytes():
+            raise ValueError("planning_overhead_mb must be strictly smaller than usable memory")
 
         if type(self.streamed_ffn_layers) is not int or not (
             0 <= self.streamed_ffn_layers <= self.model_config.num_layers
@@ -262,3 +288,30 @@ class ReplicaConfig:
                 int(self.world_size) > int(self.node_config.num_devices_per_node)
             ),
         )
+
+    def get_nominal_memory_bytes(self) -> int:
+        """Return physical device memory in exact bytes from binary GiB."""
+        return self.device_config.get_nominal_memory_bytes()
+
+    def get_usable_memory_bytes(self) -> int:
+        """Return effective usable per-device memory in exact bytes (binary MiB)."""
+        if self.usable_memory_mb is not None:
+            return int(round(float(self.usable_memory_mb) * BINARY_MIB_BYTES))
+        return self.device_config.get_usable_memory_bytes()
+
+    def get_planning_overhead_bytes(self) -> int:
+        """Return effective per-device planning overhead in exact bytes (binary MiB)."""
+        if self.planning_overhead_mb is not None:
+            return int(round(float(self.planning_overhead_mb) * BINARY_MIB_BYTES))
+        return self.device_config.get_planning_overhead_bytes()
+
+    def has_relaxed_memory_budget_override(self) -> bool:
+        """Return whether explicit config overrides relax the device SKU net SRAM budget."""
+        effective_net = (
+            self.get_usable_memory_bytes() - self.get_planning_overhead_bytes()
+        )
+        default_net = (
+            self.device_config.get_usable_memory_bytes()
+            - self.device_config.get_planning_overhead_bytes()
+        )
+        return effective_net > default_net

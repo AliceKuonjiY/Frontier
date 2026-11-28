@@ -10,13 +10,15 @@
 #   network/hpp2_16rank/{all_reduce.csv,weight_stream_lut.csv}
 #   network/h200_prefill_to_decode_attn/kv_cache_transfer_lut.csv
 #
-# The analytical M2N/KV/CC settings below are fitted from those LUTs:
+# The analytical M2N/CC settings and KV LUT contract below match those tables:
 #   M2N HostBounce (segmented): IB 366 Gbps + per-layer HPP2 PCIe 23 GB/s
 #     - the IB segment is priced by the analytical M2N bandwidth
 #     - the PCIe segment is priced by the per-layer HPP2 CPU-overhead table
 #     - the two segments are serial; do not also use the 122.44 Gbps
 #       HostBounce single-segment effective bandwidth
-#   KV NVLink:  3172.5 Gbps, 0.0208 ms latency
+#   KV Cache Transfer (LUT-driven by PD node placement):
+#     - <=8 H200 total (same_node):  NVLink_IntraNode (measured LUT, ~3172.5 Gbps / 0.0208 ms)
+#     - >8 H200 total (cross_node):  RDMA_IB_400G_Direct (400 Gbps SOL, ~1.51 ms @ 512 tok)
 #   HPP2 ring:  2984 Gbps intra-node (373 GB/s), 0 latency
 
 set -euo pipefail
@@ -35,9 +37,35 @@ NUM_REQUESTS="${NUM_REQUESTS:-8}"
 PREFILL_TOKENS="${PREFILL_TOKENS:-512}"
 DECODE_TOKENS="${DECODE_TOKENS:-64}"
 ARRIVAL_PATTERN="${ARRIVAL_PATTERN:-burst}"
-WEIGHT_STREAM_LAYERS="${WEIGHT_STREAM_LAYERS:-0}"
+PREFILL_REPLICAS="${PREFILL_REPLICAS:-1}"
+PREFILL_TP="${PREFILL_TP:-8}"
+DECODE_ATTN_REPLICAS="${DECODE_ATTN_REPLICAS:-1}"
+DECODE_ATTN_TP="${DECODE_ATTN_TP:-8}"
+DECODE_FFN_REPLICAS="${DECODE_FFN_REPLICAS:-1}"
+WEIGHT_STREAM_LAYERS="${WEIGHT_STREAM_LAYERS:-2}"
+HPP2_USABLE_MEMORY_MB="${HPP2_USABLE_MEMORY_MB:-170}"
+HPP2_PLANNING_OVERHEAD_MB="${HPP2_PLANNING_OVERHEAD_MB:-10}"
 AF_MICRO_BATCH="${AF_MICRO_BATCH:-1}"
 DECODE_ATTN_MICRO_BATCH_SIZE="${DECODE_ATTN_MICRO_BATCH_SIZE:-8}"
+KV_LUT_PATH="${KV_LUT_PATH-data/profiling/network/h200_prefill_to_decode_attn/kv_cache_transfer_lut.csv}"
+KV_PD_PLACEMENT="${KV_PD_PLACEMENT:-auto}"
+KV_LINK_TYPE="${KV_LINK_TYPE:-}"
+KV_LUT_PRICING_MODE="${KV_LUT_PRICING_MODE:-piecewise_linear}"
+KV_EXTRA_LATENCY_MS="${KV_EXTRA_LATENCY_MS:-0.0}"
+KV_ALLOW_INFEASIBLE_PLACEMENT="${KV_ALLOW_INFEASIBLE_PLACEMENT:-0}"
+
+H200_PREFILL_CARDS=$(( PREFILL_REPLICAS * PREFILL_TP ))
+H200_DECODE_CARDS=$(( DECODE_ATTN_REPLICAS * DECODE_ATTN_TP ))
+H200_TOTAL_CARDS=$(( H200_PREFILL_CARDS + H200_DECODE_CARDS ))
+
+if [ "$KV_PD_PLACEMENT" = "same_node" ] && [ "$H200_TOTAL_CARDS" -gt 8 ] && [ "$#" -eq 0 ]; then
+  if [ "$KV_ALLOW_INFEASIBLE_PLACEMENT" != "1" ]; then
+    echo "ERROR: KV_PD_PLACEMENT=same_node is infeasible for ${H200_PREFILL_CARDS}P + ${H200_DECODE_CARDS}D = ${H200_TOTAL_CARDS} H200 GPUs (> 8/node)." >&2
+    echo "       Use KV_PD_PLACEMENT=auto/cross_node for RDMA_IB_400G_Direct, or set KV_ALLOW_INFEASIBLE_PLACEMENT=1 for sensitivity." >&2
+    exit 2
+  fi
+  echo "WARNING: Running infeasible KV_PD_PLACEMENT=same_node on ${H200_TOTAL_CARDS} H200 GPUs with KV_ALLOW_INFEASIBLE_PLACEMENT=1." >&2
+fi
 
 cd "$REPO_ROOT"
 
@@ -53,7 +81,6 @@ REQUIRED=(
   "data/profiling/network/a2f_h200_to_hpp2/m2n_transfer_lut.csv"
   "data/profiling/network/hpp2_16rank/all_reduce.csv"
   "data/profiling/network/hpp2_16rank/weight_stream_lut.csv"
-  "data/profiling/network/h200_prefill_to_decode_attn/kv_cache_transfer_lut.csv"
 )
 for path in "${REQUIRED[@]}"; do
   if [ ! -f "$path" ]; then
@@ -88,6 +115,45 @@ case "$WEIGHT_STREAM_LAYERS" in
     ;;
 esac
 
+CLI_OVERRIDES_FFN_BUDGET=0
+for arg in "$@"; do
+  case "$arg" in
+    --cluster_config_decode_ffn_replica_config_streamed_ffn_layers|--cluster_config_decode_ffn_replica_config_streamed_ffn_layers=*)
+      echo "ERROR: Do not pass $arg via trailing script arguments; set WEIGHT_STREAM_LAYERS=<0|1|2|3> so the matching stream CPU-overhead table and SRAM guard stay in sync." >&2
+      exit 2
+      ;;
+    --cluster_config_decode_ffn_replica_config_usable_memory_mb|--cluster_config_decode_ffn_replica_config_usable_memory_mb=*|\
+    --cluster_config_decode_ffn_replica_config_planning_overhead_mb|--cluster_config_decode_ffn_replica_config_planning_overhead_mb=*|\
+    --cluster_config_decode_ffn_replica_config_moe_tensor_parallel_size|--cluster_config_decode_ffn_replica_config_moe_tensor_parallel_size=*)
+      CLI_OVERRIDES_FFN_BUDGET=1
+      ;;
+  esac
+done
+
+# Validate HPP2 SRAM budget env inputs before applying the TP16 guard.
+if ! awk -v u="$HPP2_USABLE_MEMORY_MB" -v o="$HPP2_PLANNING_OVERHEAD_MB" \
+  'BEGIN { num = "^[0-9]+(\\.[0-9]+)?$"; exit !(u ~ num && o ~ num && u > 0 && u <= 192 && o >= 0 && o < u) }'; then
+  echo "ERROR: Invalid HPP2 SRAM budget (HPP2_USABLE_MEMORY_MB=${HPP2_USABLE_MEMORY_MB}, HPP2_PLANNING_OVERHEAD_MB=${HPP2_PLANNING_OVERHEAD_MB}); require numeric 0 < usable <= 192 MiB and 0 <= overhead < usable MiB." >&2
+  exit 2
+fi
+
+# Strict binary MiB HPP2 SRAM guard: 170 MiB usable - 10 MiB overhead = 160 MiB.
+# At TP16, stream 0/1 needs 36 * 4,669,440 B = 160.3125 MiB on-chip; fail fast
+# unless the numeric net budget (usable - overhead) is explicitly relaxed above 160.3125 MiB
+# or trailing CLI flags override decode-FFN budget/TP for MemoryPlanner to validate.
+if [ "$WEIGHT_STREAM_LAYERS" = "0" ] || [ "$WEIGHT_STREAM_LAYERS" = "1" ]; then
+  if [ "$CLI_OVERRIDES_FFN_BUDGET" = "1" ]; then
+    echo "WARNING: Deferring WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS HPP2 SRAM check to MemoryPlanner due to trailing CLI decode-FFN budget/TP override." >&2
+  elif awk -v u="$HPP2_USABLE_MEMORY_MB" -v o="$HPP2_PLANNING_OVERHEAD_MB" \
+    'BEGIN { exit !((u - o) > 160.3125) }'; then
+    echo "WARNING: Running WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS with relaxed HPP2 SRAM budget (usable=${HPP2_USABLE_MEMORY_MB} MiB, overhead=${HPP2_PLANNING_OVERHEAD_MB} MiB; default 170/10 MiB is infeasible)." >&2
+  else
+    echo "ERROR: WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS requires 160.31 MiB + ${HPP2_PLANNING_OVERHEAD_MB} MiB > ${HPP2_USABLE_MEMORY_MB} MiB usable SRAM (default 170.00 MiB usable / 10.00 MiB overhead, nominal 192 MiB)." >&2
+    echo "       Use WEIGHT_STREAM_LAYERS=2 (155.86 + 10.00 = 165.86 MiB) or 3 (151.41 + 10.00 = 161.41 MiB), or override HPP2_USABLE_MEMORY_MB / HPP2_PLANNING_OVERHEAD_MB for diagnostics." >&2
+    exit 2
+  fi
+fi
+
 case "$ARRIVAL_PATTERN" in
   burst)
     ARRIVAL_ARGS=(--interval_generator_config_type static)
@@ -117,19 +183,19 @@ CMD=(
   --sys_arch pd-af-disaggregation
   --no-enable_parallel_clusters
 
-  --cluster_config_prefill_cluster_num_replicas 1
-  --cluster_config_decode_attn_cluster_num_replicas 1
-  --cluster_config_decode_ffn_cluster_num_replicas 1
+  --cluster_config_prefill_cluster_num_replicas "$PREFILL_REPLICAS"
+  --cluster_config_decode_attn_cluster_num_replicas "$DECODE_ATTN_REPLICAS"
+  --cluster_config_decode_ffn_cluster_num_replicas "$DECODE_FFN_REPLICAS"
 
   --cluster_config_decode_attn_af_pipeline_num_micro_batch "$AF_MICRO_BATCH"
   --cluster_config_decode_ffn_af_pipeline_num_micro_batch "$AF_MICRO_BATCH"
   --cluster_config_decode_attn_micro_batch_size "$DECODE_ATTN_MICRO_BATCH_SIZE"
 
-  # PREFILL: 8x H200, dense attention TP8.  The dense FFN follows attn TP8;
-  # moe_tp=8 only satisfies the shared role contract and is unused by a dense FFN.
+  # PREFILL: H200, dense attention TP=PREFILL_TP.  The dense FFN follows attn TP;
+  # moe_tp only satisfies the shared role contract and is unused by a dense FFN.
   --cluster_config_prefill_replica_config_num_pipeline_stages 1
-  --cluster_config_prefill_replica_config_attn_tensor_parallel_size 8
-  --cluster_config_prefill_replica_config_moe_tensor_parallel_size 8
+  --cluster_config_prefill_replica_config_attn_tensor_parallel_size "$PREFILL_TP"
+  --cluster_config_prefill_replica_config_moe_tensor_parallel_size "$PREFILL_TP"
   --cluster_config_prefill_replica_config_moe_expert_parallel_size 1
   --cluster_config_prefill_replica_config_total_expert_num 1
   --cluster_config_prefill_replica_config_router_topk 1
@@ -137,9 +203,9 @@ CMD=(
   --cluster_config_prefill_replica_config_network_device h200_dgx
   --cluster_config_prefill_replica_config_memory_margin_fraction 0.2
 
-  # DECODE_ATTN: 8x H200, dense attention TP8.
+  # DECODE_ATTN: H200, dense attention TP=DECODE_ATTN_TP.
   --cluster_config_decode_attn_replica_config_num_pipeline_stages 1
-  --cluster_config_decode_attn_replica_config_attn_tensor_parallel_size 8
+  --cluster_config_decode_attn_replica_config_attn_tensor_parallel_size "$DECODE_ATTN_TP"
   --cluster_config_decode_attn_replica_config_device h200
   --cluster_config_decode_attn_replica_config_network_device h200_dgx
   --cluster_config_decode_attn_replica_config_memory_margin_fraction 0.2
@@ -154,6 +220,8 @@ CMD=(
   --cluster_config_decode_ffn_replica_config_router_topk 1
   --cluster_config_decode_ffn_replica_config_device hpp2
   --cluster_config_decode_ffn_replica_config_streamed_ffn_layers "$WEIGHT_STREAM_LAYERS"
+  --cluster_config_decode_ffn_replica_config_usable_memory_mb "$HPP2_USABLE_MEMORY_MB"
+  --cluster_config_decode_ffn_replica_config_planning_overhead_mb "$HPP2_PLANNING_OVERHEAD_MB"
   --cluster_config_decode_ffn_replica_config_network_device hpp2_16rank
   --cluster_config_decode_ffn_replica_config_memory_margin_fraction 0.0
 
@@ -165,15 +233,18 @@ CMD=(
   --m2n_transfer_config_type analytical
   --kv_cache_transfer_config_type analytical
 
-  # Fitted from the filled M2N / KV / all-reduce LUTs.
+  # Fitted from the filled M2N / all-reduce LUTs; KV transfer is priced directly
+  # from kv_cache_transfer_lut.csv according to PD node placement (auto: <=8 H200
+  # -> NVLink_IntraNode, >8 H200 -> RDMA_IB_400G_Direct).
   # M2N HostBounce is segmented: 366 Gbps is the IB segment; the per-layer
   # PCIe segment is carried by the HPP2 CPU-overhead table (23 GB/s).
   --analytical_m2_n_transfer_config_p2p_protocol host_bounce
   --analytical_m2_n_transfer_config_memory_bandwidth_gbps 366.0
   --analytical_m2_n_transfer_config_network_latency_ms 0.0
   --no-analytical_m2_n_transfer_config_enable_p2p_optimization
-  --analytical_kv_cache_transfer_config_network_bandwidth_gbps 3172.5
-  --analytical_kv_cache_transfer_config_network_latency_ms 0.0208
+  --analytical_kv_cache_transfer_config_pd_placement "$KV_PD_PLACEMENT"
+  --analytical_kv_cache_transfer_config_lut_pricing_mode "$KV_LUT_PRICING_MODE"
+  --analytical_kv_cache_transfer_config_extra_latency_ms "$KV_EXTRA_LATENCY_MS"
   --analytical_cc_backend_config_intra_node_bandwidth_gbps 2984.0
   --analytical_cc_backend_config_network_bandwidth_gbps 292.8
   --analytical_cc_backend_config_network_latency_us 0.0
@@ -212,6 +283,28 @@ CMD=(
   --no-metrics_config_write_json_trace
 )
 
+if [ -n "$KV_LUT_PATH" ]; then
+  if [ ! -f "$KV_LUT_PATH" ]; then
+    echo "ERROR: missing KV cache transfer LUT file: $KV_LUT_PATH" >&2
+    exit 2
+  fi
+  CMD+=(
+    --analytical_kv_cache_transfer_config_lut_path "$KV_LUT_PATH"
+  )
+fi
+
+if [ -n "$KV_LINK_TYPE" ]; then
+  CMD+=(
+    --analytical_kv_cache_transfer_config_link_type "$KV_LINK_TYPE"
+  )
+fi
+
+if [ "$KV_ALLOW_INFEASIBLE_PLACEMENT" = "1" ]; then
+  CMD+=(
+    --analytical_kv_cache_transfer_config_allow_infeasible_placement_override
+  )
+fi
+
 if [ -n "$CPU_OVERHEAD_TEMPLATE" ]; then
   CMD+=(
     --random_forrest_execution_time_predictor_config_cpu_overhead_kernel_only_input_file
@@ -226,11 +319,12 @@ fi
 echo "========================================================="
 echo " Qwen3-4B PD-AF"
 echo " model: Qwen3-4B"
-echo " PREFILL:    h200 x8, attn TP8"
-echo " DECODE_ATTN:h200 x8, attn TP8"
-echo " DECODE_FFN: hpp2 x8/16 ranks, FFN TP16"
+echo " PREFILL:    ${PREFILL_REPLICAS}x h200 TP${PREFILL_TP} (${H200_PREFILL_CARDS} GPU)"
+echo " DECODE_ATTN:${DECODE_ATTN_REPLICAS}x h200 TP${DECODE_ATTN_TP} (${H200_DECODE_CARDS} GPU)"
+echo " DECODE_FFN: ${DECODE_FFN_REPLICAS}x hpp2 TP16 (${HPP2_USABLE_MEMORY_MB} MiB usable, ${HPP2_PLANNING_OVERHEAD_MB} MiB overhead, 192 MiB nominal)"
+echo " KV link:    placement=${KV_PD_PLACEMENT} (${H200_TOTAL_CARDS} H200), lut=${KV_LUT_PATH:-none}, mode=${KV_LUT_PRICING_MODE}, extra_lat=${KV_EXTRA_LATENCY_MS} ms"
 echo " requests:   $NUM_REQUESTS, prefill=$PREFILL_TOKENS, decode=$DECODE_TOKENS; $ARRIVAL_DESCRIPTION"
-echo " weight stream: $WEIGHT_STREAM_LAYERS layer(s) (0 = all resident)"
+echo " weight stream: $WEIGHT_STREAM_LAYERS layer(s)"
 echo " metrics:    $OUT_DIR/$RUN_ID"
 echo "========================================================="
 exec "${CMD[@]}"

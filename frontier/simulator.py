@@ -188,6 +188,9 @@ class Simulator:
             kv_cache_transfer_predictor = KVCacheTransferPredictorRegistry.get(
                 self._config.kv_cache_transfer_config.get_type(),
                 config=self._config.kv_cache_transfer_config,
+                resolved_profile=getattr(
+                    self._config, "resolved_kv_cache_transfer_profile", None
+                ),
             )
 
         m2n_transfer_predictor = None

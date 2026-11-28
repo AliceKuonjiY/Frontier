@@ -1,6 +1,7 @@
 from collections import deque
 from typing import Any, List, NamedTuple, Tuple, Optional
 from frontier.entities import Batch, Request, EPBatchGroup
+from frontier.errors import FrontierMemoryOOMError
 from frontier.scheduler.cluster_scheduler.base_cluster_scheduler import (
     BaseClusterScheduler,
 )
@@ -621,6 +622,27 @@ class RoundRobinClusterScheduler(BaseClusterScheduler):
                             f"an exact non-negative int, got {activation_bytes!r}"
                         )
                     activation_delta += activation_bytes
+                activation_capacity = getattr(
+                    replica_scheduler,
+                    "_activation_memory_capacity_bytes",
+                    None,
+                )
+                if (
+                    type(activation_capacity) is int
+                    and activation_memory + activation_delta > activation_capacity
+                ):
+                    raise FrontierMemoryOOMError(
+                        "DECODE_FFN activation bytes exceed remaining SRAM capacity "
+                        f"(allocated={activation_memory} B + incoming={activation_delta} B > "
+                        f"capacity={activation_capacity} B).",
+                        reason="insufficient_activation_budget",
+                        details={
+                            "cluster_type": ClusterType.DECODE_FFN.name,
+                            "allocated_activation_bytes": activation_memory,
+                            "incoming_activation_bytes": activation_delta,
+                            "activation_memory_capacity_bytes": activation_capacity,
+                        },
+                    )
                 prepared_commits.append(
                     (replica_scheduler, batches, activation_delta)
                 )

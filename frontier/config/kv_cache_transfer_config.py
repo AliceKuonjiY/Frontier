@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import math
 from typing import Optional
 
 from frontier.config.base_poly_config import BasePolyConfig
@@ -7,15 +8,22 @@ from frontier.types import KVCacheTransferType
 # vLLM KV connectors of a PDD prefill instance whose device work Frontier prices.
 KV_CONNECTORS = ("none", "p2p_nccl")
 
+PD_PLACEMENTS = ("auto", "same_node", "cross_node")
+LUT_PRICING_MODES = ("piecewise_linear", "linear_fit")
+DEFAULT_INTRA_NODE_LINK_TYPE = "NVLink_IntraNode"
+DEFAULT_INTER_NODE_LINK_TYPE = "RDMA_IB_400G_Direct"
+DEFAULT_NETWORK_BANDWIDTH_GBPS = 100.0
+DEFAULT_NETWORK_LATENCY_MS = 0.1
+
 
 def _require_positive(value: float | int, field_name: str) -> None:
-    if value <= 0:
-        raise ValueError(f"{field_name} must be > 0, got {value}")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be > 0 and finite, got {value}")
 
 
 def _require_non_negative(value: float | int, field_name: str) -> None:
-    if value < 0:
-        raise ValueError(f"{field_name} must be >= 0, got {value}")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{field_name} must be >= 0 and finite, got {value}")
 
 
 def _require_optional_positive(value: Optional[int], field_name: str) -> None:
@@ -58,7 +66,31 @@ class BaseKVCacheTransferConfig(BasePolyConfig):
     )
     transfer_protocol: str = field(
         default="rdma",
-        metadata={"help": "Transfer protocol: rdma, tcp, infiniband."},
+        metadata={"help": "Transfer protocol: rdma, infiniband, nvlink, host_bounce, tcp."},
+    )
+    pd_placement: Optional[str] = field(
+        default=None,
+        metadata={"help": "PD node placement: None (legacy explicit), 'auto', 'same_node', or 'cross_node'."},
+    )
+    lut_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to kv_cache_transfer_lut.csv for placement-driven LUT pricing."},
+    )
+    link_type: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional explicit link_type row in lut_path (requires lut_path)."},
+    )
+    lut_pricing_mode: str = field(
+        default="piecewise_linear",
+        metadata={"help": "LUT pricing mode: 'piecewise_linear' or 'linear_fit'."},
+    )
+    extra_latency_ms: float = field(
+        default=0.0,
+        metadata={"help": "Additive fixed latency in ms for sensitivity runs."},
+    )
+    allow_infeasible_placement_override: bool = field(
+        default=False,
+        metadata={"help": "Diagnostic opt-in: allow infeasible pd_placement='same_node' with WARNING."},
     )
     kv_connector: str = field(
         default="none",
@@ -80,7 +112,17 @@ class BaseKVCacheTransferConfig(BasePolyConfig):
         _require_positive(self.network_bandwidth_gbps, "network_bandwidth_gbps")
         _require_non_negative(self.network_latency_ms, "network_latency_ms")
         _require_positive(self.compression_ratio, "compression_ratio")
+        _require_non_negative(self.extra_latency_ms, "extra_latency_ms")
         _require_non_negative(self.kv_send_slowdown_per_layer_ms, "kv_send_slowdown_per_layer_ms")
+        self.pd_placement = (self.pd_placement or "").strip() or None
+        self.lut_path = (self.lut_path or "").strip() or None
+        self.link_type = (self.link_type or "").strip() or None
+        if self.pd_placement is not None and self.pd_placement not in PD_PLACEMENTS:
+            raise ValueError(f"pd_placement must be one of {list(PD_PLACEMENTS)}, got {self.pd_placement!r}")
+        if self.link_type is not None and self.lut_path is None:
+            raise ValueError(f"link_type={self.link_type!r} requires lut_path to be set.")
+        if self.lut_pricing_mode not in LUT_PRICING_MODES:
+            raise ValueError(f"lut_pricing_mode must be one of {list(LUT_PRICING_MODES)}, got {self.lut_pricing_mode!r}")
         if self.kv_connector not in KV_CONNECTORS:
             raise ValueError(f"kv_connector must be one of {list(KV_CONNECTORS)}, got {self.kv_connector!r}")
         if self.kv_send_slowdown_per_layer_ms > 0 and self.kv_connector == "none":

@@ -442,3 +442,194 @@ def test_qwen3_4b_af_microbatch_defaults_and_overrides(tmp_path: Path) -> None:
     assert _option_value(
         af2_argv, "--cluster_config_decode_attn_micro_batch_size"
     ) == "32"
+
+
+def test_qwen3_4b_defaults_to_stream2_with_binary_170_mib_and_10_mib_overhead(
+    tmp_path: Path,
+) -> None:
+    argv = _capture_cli(
+        tmp_path,
+        "offline/qwen3_4b_pd_af.sh",
+        env_overrides={"OUT_DIR": (tmp_path / "out").as_posix()},
+    )
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_streamed_ffn_layers") == "2"
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_usable_memory_mb") == "170"
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_planning_overhead_mb") == "10"
+
+
+@pytest.mark.parametrize(
+    ("stream_layers", "extra_env"),
+    [
+        ("0", {}),
+        ("1", {}),
+        ("0", {"HPP2_USABLE_MEMORY_MB": "170.0", "HPP2_PLANNING_OVERHEAD_MB": "10.0"}),
+        ("0", {"HPP2_USABLE_MEMORY_MB": "169", "HPP2_PLANNING_OVERHEAD_MB": "10"}),
+        ("0", {"HPP2_USABLE_MEMORY_MB": "180", "HPP2_PLANNING_OVERHEAD_MB": "20"}),
+    ],
+)
+def test_qwen3_4b_rejects_infeasible_stream_layers_by_default(
+    tmp_path: Path, stream_layers: str, extra_env: dict[str, str]
+) -> None:
+    env = os.environ.copy()
+    env.update(
+        {
+            "OUT_DIR": (tmp_path / "out").as_posix(),
+            "WEIGHT_STREAM_LAYERS": stream_layers,
+            **extra_env,
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "ERROR:" in result.stderr
+    assert "WARNING:" not in result.stderr
+    assert "WEIGHT_STREAM_LAYERS=2" in result.stderr
+
+
+def test_qwen3_4b_allows_diagnostic_override_for_stream0_with_warning(
+    tmp_path: Path,
+) -> None:
+    capture_path = tmp_path / "diag.argv"
+    fake_python = tmp_path / "capture_python.sh"
+    fake_python.write_bytes(b"#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE_PATH\"\n")
+    fake_python.chmod(0o755)
+    env = os.environ.copy()
+    env.update(
+        {
+            "CAPTURE_PATH": capture_path.as_posix(),
+            "PYTHON_BIN": fake_python.as_posix(),
+            "OUT_DIR": (tmp_path / "out").as_posix(),
+            "WEIGHT_STREAM_LAYERS": "0",
+            "HPP2_USABLE_MEMORY_MB": "192",
+            "HPP2_PLANNING_OVERHEAD_MB": "0",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WARNING:" in result.stderr
+    argv = capture_path.read_text(encoding="utf-8").splitlines()
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_usable_memory_mb") == "192"
+    assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_planning_overhead_mb") == "0"
+
+
+@pytest.mark.parametrize(
+    "extra_env",
+    [
+        {"HPP2_USABLE_MEMORY_MB": "200"},
+        {"HPP2_USABLE_MEMORY_MB": "abc"},
+        {"HPP2_PLANNING_OVERHEAD_MB": "170"},
+    ],
+)
+def test_qwen3_4b_reports_clear_error_for_invalid_sram_budget_env(
+    tmp_path: Path, extra_env: dict[str, str]
+) -> None:
+    env = {
+        **os.environ,
+        "OUT_DIR": (tmp_path / "out").as_posix(),
+        "WEIGHT_STREAM_LAYERS": "0",
+        **extra_env,
+    }
+    result = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "Invalid HPP2 SRAM budget" in result.stderr
+    assert "requires 160.31 MiB" not in result.stderr
+
+
+def test_qwen3_4b_handles_trailing_cli_decode_ffn_overrides(tmp_path: Path) -> None:
+    # Trailing streamed_ffn_layers override is rejected to avoid CPU-overhead table mismatch.
+    env = {**os.environ, "OUT_DIR": (tmp_path / "out").as_posix()}
+    bad = subprocess.run(
+        [
+            "bash",
+            str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh"),
+            "--cluster_config_decode_ffn_replica_config_streamed_ffn_layers",
+            "3",
+        ],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert bad.returncode != 0
+    assert "WEIGHT_STREAM_LAYERS" in bad.stderr
+
+    # Trailing decode-FFN usable budget override defers validation to MemoryPlanner.
+    capture_path = tmp_path / "cli_override.argv"
+    fake_python = tmp_path / "capture_python.sh"
+    fake_python.write_bytes(b"#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE_PATH\"\n")
+    fake_python.chmod(0o755)
+    override_env = {
+        **env,
+        "CAPTURE_PATH": capture_path.as_posix(),
+        "PYTHON_BIN": fake_python.as_posix(),
+        "WEIGHT_STREAM_LAYERS": "0",
+    }
+    ok = subprocess.run(
+        [
+            "bash",
+            str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh"),
+            "--cluster_config_decode_ffn_replica_config_usable_memory_mb",
+            "180",
+        ],
+        cwd=REPO_ROOT, env=override_env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "Deferring" in ok.stderr
+    argv = capture_path.read_text(encoding="utf-8").splitlines()
+    assert argv[-2:] == [
+        "--cluster_config_decode_ffn_replica_config_usable_memory_mb",
+        "180",
+    ]
+
+
+def test_qwen3_4b_uses_kv_lut_and_placement_guards(tmp_path: Path) -> None:
+    argv = _capture_cli(tmp_path, "offline/qwen3_4b_pd_af.sh", env_overrides={"OUT_DIR": (tmp_path / "out").as_posix()})
+    assert _option_value(argv, "--analytical_kv_cache_transfer_config_pd_placement") == "auto"
+    assert _option_value(argv, "--analytical_kv_cache_transfer_config_lut_path").endswith("kv_cache_transfer_lut.csv")
+    assert "--analytical_kv_cache_transfer_config_network_bandwidth_gbps" not in argv
+    assert "--analytical_kv_cache_transfer_config_network_latency_ms" not in argv
+
+    # 16-card same_node fails fast without override
+    env = {**os.environ, "OUT_DIR": (tmp_path / "fail").as_posix(), "KV_PD_PLACEMENT": "same_node"}
+    res = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode != 0 and "KV_ALLOW_INFEASIBLE_PLACEMENT=1" in res.stderr
+
+    # Explicit override passes sensitivity flag; 8-card topology accepts same_node cleanly
+    argv_sens = _capture_cli(
+        tmp_path, "offline/qwen3_4b_pd_af.sh",
+        env_overrides={
+            "OUT_DIR": (tmp_path / "sens").as_posix(),
+            "KV_PD_PLACEMENT": "same_node",
+            "KV_ALLOW_INFEASIBLE_PLACEMENT": "1",
+            "KV_EXTRA_LATENCY_MS": "0.02",
+        },
+    )
+    assert "--analytical_kv_cache_transfer_config_allow_infeasible_placement_override" in argv_sens
+    assert _option_value(argv_sens, "--analytical_kv_cache_transfer_config_extra_latency_ms") == "0.02"
+
+    argv_8g = _capture_cli(
+        tmp_path, "offline/qwen3_4b_pd_af.sh",
+        env_overrides={
+            "OUT_DIR": (tmp_path / "g8").as_posix(),
+            "PREFILL_REPLICAS": "2", "PREFILL_TP": "2",
+            "DECODE_ATTN_REPLICAS": "2", "DECODE_ATTN_TP": "2",
+            "KV_PD_PLACEMENT": "same_node",
+        },
+    )
+    assert _option_value(argv_8g, "--cluster_config_prefill_cluster_num_replicas") == "2"
+    assert "--analytical_kv_cache_transfer_config_allow_infeasible_placement_override" not in argv_8g
+
+    # Clearing KV_LUT_PATH omits --lut_path and does not require default LUT in REQUIRED
+    argv_manual = _capture_cli(
+        tmp_path, "offline/qwen3_4b_pd_af.sh",
+        env_overrides={"OUT_DIR": (tmp_path / "manual").as_posix(), "KV_LUT_PATH": ""},
+    )
+    assert "--analytical_kv_cache_transfer_config_lut_path" not in argv_manual

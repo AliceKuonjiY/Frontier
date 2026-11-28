@@ -96,6 +96,8 @@ class ClusterRoleConfigBuilder:
             model_name=get_field_value("model_name"),
             memory_margin_fraction=get_field_value("memory_margin_fraction"),
             streamed_ffn_layers=get_field_value("streamed_ffn_layers"),
+            usable_memory_mb=get_field_value("usable_memory_mb"),
+            planning_overhead_mb=get_field_value("planning_overhead_mb"),
             num_pipeline_stages=num_pipeline_stages,
             attn_tensor_parallel_size=attn_tensor_parallel_size,
             attn_dp=attn_dp,
@@ -578,6 +580,8 @@ class ClusterRoleConfigBuilder:
         return ReplicaConfig(
             model_name=original_config.model_name,
             memory_margin_fraction=original_config.memory_margin_fraction,
+            usable_memory_mb=original_config.usable_memory_mb,
+            planning_overhead_mb=original_config.planning_overhead_mb,
             num_pipeline_stages=original_config.num_pipeline_stages,
             attn_tensor_parallel_size=original_config.attn_tensor_parallel_size,
             attn_dp=original_config.attn_dp,
