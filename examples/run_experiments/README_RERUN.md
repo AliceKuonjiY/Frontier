@@ -11,10 +11,10 @@
 | --name NAME                 | 无                     | 只跑指定实验名，可重复        | 显式点名时忽略 profile/tier，任何 tier 都能跑    |
 | --suite {calibration10}     | 无                     | 跑官方 10-case 校准集         | 优先于 --stage 和 --profile                      |
 | --include-experimental      | 关闭                   | 加入 tier=experimental 的配置 | 主要是 DECODE_ATTN PP>1，当前模拟器可能仍拒绝    |
-| --output-dir PATH           | runs/<时间戳>_<commit> | 指定输出目录                  | 复用同一目录即断点续跑                           |
+| --output-dir PATH           | outputs/runs/<时间戳>_<commit> | 指定输出目录                  | 相对路径按 outputs/runs 解析；复用同一目录即断点续跑 |
 | --workers N                 | 3                      | 并行仿真进程数                | 8 GB 内存建议不超过 3                            |
 | --timeout N                 | 3600                   | 单次仿真超时秒数              | 400 请求长跑可设 7200                            |
-| --force                     | 关闭                   | 忽略已有 CSV，全部重跑        | 会重写 CSV，见下面“注意”                         |
+| --force                     | 关闭                   | 强制重跑选中配置              | 保留其他 stage 的结果；详见第 5 节               |
 | --list                      | -                      | 只列出选中的配置              | 不跑仿真                                         |
 | --dry-run                   | -                      | 预检并打印配置和第一条命令    | 不创建输出目录、不跑仿真                         |
 | -h/--help                   | -                      | 帮助                          |                                                  |
@@ -42,12 +42,16 @@ cd Frontier/examples/run_experiments
 
 ```text
 Frontier/outputs/runs/<YYYYmmdd_HHMMSS>_<commit>/
-├── manifest.json          # git commit / dirty / Python / 实验清单
-├── commands.txt           # 实际执行的完整命令
-├── sweep_results.csv      # 增量写入；中断后可用同一目录续跑
-├── summary.md             # 自动生成的汇总表
-├── logs/<name>.log        # 单次仿真日志
-└── outputs/qwen3_4b/offline_batch/<name>/
+├── manifest.json          # 最近一次运行；完整历史在 manifests/<run_id>.json
+├── commands.txt           # 最近一次运行的命令模板
+├── sweep_results.csv      # 全部历史/本次结果；中断后可用同一目录续跑
+├── current_results.csv    # 只含当前源码+配置指纹匹配的结果
+├── summary.md             # 自动生成的汇总表（排名只用 current 行）
+├── manifests/<run_id>.json
+├── summaries/<run_id>.md
+├── commands/<run_id>.txt
+├── attempts/<name>_<attempt>/   # 每次尝试独占；run.log / command.txt
+└── outputs/qwen3_4b/offline_batch/<name>/  # 校验成功后才发布
     ├── system_metrics.json
     ├── request_metrics.csv
     └── config.json
@@ -78,6 +82,7 @@ Frontier/outputs/runs/<YYYYmmdd_HHMMSS>_<commit>/
 ./run_experiments.sh --stage attn_stage_parallel --include-experimental --workers 2
 
 # 只跑 400 请求 × 5 种子长跑（很慢，显式指定）
+# 每个 seed 会同时传给 synthetic generator，生成不同到达序列
 ./run_experiments.sh --stage online_long --workers 2
 
 # 跑官方 10-case 校准集，结果可直接喂给 compare.py
@@ -173,8 +178,11 @@ python   = Frontier/.venv/bin/python
 
 已出现在 `sweep_results.csv` 里的配置会跳过，但只有
 `run_fingerprint`（git commit + 未提交 diff + 实验参数）完全一致时才复用。
-如果模拟器或参数改过，旧行会自动重跑；`summary.md` 的“数据来源”表会标记
-每条结果是“当前 / 旧不匹配 / 未选”。
+如果模拟器或参数改过，旧行会自动重跑；`summary.md` 的排名和关键对照只使用
+当前源码+配置指纹匹配的行，“数据来源”表会标记每条结果的状态。
+
+每次尝试启动前会写 `pending/<name>.json`，成功后才删除。中断或失败留下的
+pending 标记会让下次续跑自动重试，并在汇总里标成“待重跑”，不会把旧行当新结果。
 
 要强制重跑选中的配置（同一目录内其他 stage 的结果会保留）：
 
@@ -194,10 +202,10 @@ python   = Frontier/.venv/bin/python
 然后：
 
 ```bash
-cd /home/yhu/Desktop/scale/Frontier
+cd <path-to-Frontier>
 .venv/bin/python -m tests.performance.qwen3_4b_pdaf.compare \
   tests/performance/qwen3_4b_pdaf/calibrated_cases.csv \
-  outputs/runs/calib_after/sweep_results.csv \
+  outputs/runs/calib_after/current_results.csv \
   /tmp/pdaf_compare
 ```
 
@@ -208,7 +216,8 @@ cd /home/yhu/Desktop/scale/Frontier
 - `prefill_util` 用 `NA` 或 `[0,1]` 小数；
 - 400 请求 Poisson 用 `pois_g16_tp2_af4_qps250_n400`，不要拿 64 请求点代替。
 
-本脚本的 CSV 已包含这些列；缺测的利用率会写 `NA`。
+`current_results.csv` 只导出与本次源码和配置指纹匹配的结果，可直接用于
+`compare.py`；`sweep_results.csv` 保留历史行用于续跑和审计。缺测的利用率会写 `NA`。
 只有 `simulation_metadata.total_requests` 和 `completed_requests` 都等于配置
 请求数时，该行才会写入成功结果；退出码为 0 但请求未跑完会记为失败。
 
@@ -219,18 +228,19 @@ cd /home/yhu/Desktop/scale/Frontier
 
 脚本会按以下顺序找 Python：
 
-1. `PYTHON_BIN`
-2. `scale/.venv/bin/python`
-3. `Frontier/.venv/bin/python`
-4. 系统 `python3`
+1. `PYTHON_BIN`：显式指定，必须是可执行命令/文件且依赖完整；失败直接退出，
+   不会回退到其他解释器。
+2. `Frontier/.venv/bin/python`
+3. 系统 `python3`
 
-不再自动执行共享 `/tmp` 下的解释器；临时虚拟环境请通过
+`PYTHON_BIN` 支持 PATH 中的命令名（如 `PYTHON_BIN=python3.11`）。
+脚本不再探测仓库父目录或共享 `/tmp` 下的 `.venv`；临时虚拟环境请通过
 `PYTHON_BIN=/path/to/python` 显式指定。
 
 推荐在 `Frontier` 下建 uv 环境：
 
 ```bash
-cd /home/yhu/Desktop/scale/Frontier
+cd <path-to-Frontier>
 uv venv .venv
 uv pip install --python .venv/bin/python -e .
 ```

@@ -54,6 +54,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import signal
 import subprocess
 import sys
@@ -61,6 +62,17 @@ import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None
+
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -76,7 +88,7 @@ DEFAULT_TIMEOUT_S = 3600
 # --dry-run / --list 时 build_command() 能正常构造命令。
 OUT_ROOT = RUNS_ROOT / "_unset" / "outputs"
 METRICS_ROOT = OUT_ROOT / "qwen3_4b" / "offline_batch"
-LOGS_ROOT = RUNS_ROOT / "_unset" / "logs"
+ATTEMPTS_ROOT = RUNS_ROOT / "_unset" / "attempts"
 RESULTS_CSV = RUNS_ROOT / "_unset" / "sweep_results.csv"
 
 # Used by the Ctrl-C path: running children get terminated, queued futures
@@ -637,7 +649,10 @@ CALIBRATION10_NAMES = {
 # ---------------------------------------------------------------------------
 
 
-def build_command(exp: Experiment) -> list[str]:
+def build_command(
+    exp: Experiment,
+    metrics_output_dir: Path | None = None,
+) -> list[str]:
     cmd = [
         sys.executable,
         "-m",
@@ -767,6 +782,8 @@ def build_command(exp: Experiment) -> list[str]:
         "synthetic",
         "--synthetic_request_generator_config_num_requests",
         str(exp.num_req),
+        "--synthetic_request_generator_config_seed",
+        str(exp.seed),
         "--length_generator_config_type",
         "fixed",
         "--fixed_request_length_generator_config_prefill_tokens",
@@ -779,7 +796,7 @@ def build_command(exp: Experiment) -> list[str]:
         "3",
         # Metrics
         "--metrics_config_output_dir",
-        str(OUT_ROOT),
+        str(metrics_output_dir or OUT_ROOT),
         "--metrics_config_run_id",
         exp.name,
         "--metrics_config_write_metrics",
@@ -846,8 +863,11 @@ class IncompleteRunError(RuntimeError):
     """The simulator exited successfully but did not finish every request."""
 
 
-def extract_metrics(exp: Experiment) -> dict[str, Any] | None:
-    base = METRICS_ROOT / exp.name
+def extract_metrics(
+    exp: Experiment,
+    metrics_root: Path | None = None,
+) -> dict[str, Any] | None:
+    base = (metrics_root or METRICS_ROOT) / exp.name
     sys_path = base / "system_metrics.json"
     req_path = base / "request_metrics.csv"
     if not sys_path.exists() or not req_path.exists():
@@ -1011,6 +1031,35 @@ def _terminate_all() -> None:
         _terminate_proc(proc)
 
 
+def publish_metrics(src: Path, dst: Path) -> None:
+    """Copy one validated attempt to the stable published path.
+
+    The attempt directory stays immutable so an older CSV row keeps pointing
+    at the exact metrics it was produced from.  The published copy is built in
+    a staging directory and renamed into place; a crash cannot expose a
+    partially copied result.
+    """
+    if not src.is_dir():
+        raise FileNotFoundError(f"attempt metrics directory missing: {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    staging = dst.with_name(f".{dst.name}.new.{time.time_ns()}")
+    backup: Path | None = None
+    try:
+        shutil.copytree(src, staging)
+        if dst.exists():
+            backup = dst.with_name(f".{dst.name}.old.{time.time_ns()}")
+            os.replace(dst, backup)
+        os.replace(staging, dst)
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        if backup is not None and not dst.exists():
+            os.replace(backup, dst)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 def run_one(
     exp: Experiment,
     timeout_s: int,
@@ -1020,9 +1069,13 @@ def run_one(
     if CANCEL_EVENT.is_set():
         return exp.name, None, "cancelled", 0.0
 
-    LOGS_ROOT.mkdir(parents=True, exist_ok=True)
-    OUT_ROOT.mkdir(parents=True, exist_ok=True)
-    log_path = LOGS_ROOT / f"{exp.name}.log"
+    ATTEMPTS_ROOT.mkdir(parents=True, exist_ok=True)
+    attempt_root = ATTEMPTS_ROOT / (
+        f"{exp.name}_{time.time_ns()}_{os.getpid()}_{threading.get_ident()}"
+    )
+    attempt_root.mkdir(parents=True, exist_ok=False)
+    log_path = attempt_root / "run.log"
+    attempt_metrics_root = attempt_root / "qwen3_4b" / "offline_batch"
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["WANDB_DISABLED"] = "true"
@@ -1030,7 +1083,8 @@ def run_one(
     env.setdefault("OMP_NUM_THREADS", "2")
     env.setdefault("OPENBLAS_NUM_THREADS", "2")
 
-    cmd = build_command(exp)
+    cmd = build_command(exp, attempt_root)
+    (attempt_root / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
     t0 = time.time()
     popen_kwargs: dict[str, Any] = {}
     if os.name == "posix":
@@ -1054,6 +1108,15 @@ def run_one(
             return exp.name, None, f"spawn failed: {exc}", 0.0
         with _RUNNING_LOCK:
             _RUNNING_PROCS.add(proc)
+            # Close the race with the main thread's KeyboardInterrupt handler:
+            # if cancellation arrived while Popen was starting, the process is
+            # now registered and must be terminated before we enter wait().
+            cancelled_after_spawn = CANCEL_EVENT.is_set()
+        if cancelled_after_spawn:
+            _terminate_proc(proc)
+            with _RUNNING_LOCK:
+                _RUNNING_PROCS.discard(proc)
+            return exp.name, None, "cancelled", round(time.time() - t0, 1)
         try:
             try:
                 rc = proc.wait(timeout=timeout_s)
@@ -1077,16 +1140,26 @@ def run_one(
             pass
         return exp.name, None, f"exit={rc}; {tail}", elapsed
     try:
-        row = extract_metrics(exp)
+        row = extract_metrics(exp, attempt_metrics_root)
     except IncompleteRunError as exc:
         return exp.name, None, str(exc), elapsed
     except Exception as exc:  # noqa: BLE001 - keep the worker alive
         return exp.name, None, f"metrics error: {exc}", elapsed
     if row is None:
         return exp.name, None, "missing metrics files", elapsed
+    attempt_result_dir = attempt_metrics_root / exp.name
+    canonical_dir = METRICS_ROOT / exp.name
+    try:
+        publish_metrics(attempt_result_dir, canonical_dir)
+    except Exception as exc:  # noqa: BLE001 - keep the worker alive
+        return exp.name, None, f"publish failed: {exc}", elapsed
     row.update(source)
     row["config_fingerprint"] = config_fingerprint(exp)
     row["run_fingerprint"] = run_fp
+    row["attempt_dir"] = str(attempt_root)
+    row["metrics_dir"] = str(attempt_result_dir)
+    row["published_dir"] = str(canonical_dir)
+    row["log_path"] = str(log_path)
     row["wall_seconds"] = elapsed
     return exp.name, row, None, elapsed
 
@@ -1231,6 +1304,29 @@ def save_csv(rows: list[dict[str, Any]], results_csv: Path) -> None:
         raise
 
 
+def _to_float(value: Any, default: float = float("nan")) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text.upper() in {"NA", "NAN", "NONE"}:
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
+def _to_int(value: Any, default: int = 1) -> int:
+    parsed = _to_float(value, default=float("nan"))
+    if math.isnan(parsed):
+        return default
+    return int(parsed)
+
+
 def _fmt(value: Any, digits: int = 2) -> str:
     if value is None:
         return "—"
@@ -1252,6 +1348,22 @@ def _table(headers: list[str], rows: Iterable[Iterable[Any]]) -> str:
 
 
 def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, Any], failures: list[tuple[str, str]]) -> None:
+    all_rows = rows
+    current_fps = manifest.get("current_fingerprints") or {
+        e.get("name"): e.get("run_fingerprint")
+        for e in manifest.get("experiments", [])
+        if isinstance(e, dict) and e.get("name")
+    }
+    pending_set = set(manifest.get("pending", []))
+    # Rankings and calibration views must use only rows produced by the same
+    # source tree and experiment config.  Historical rows stay in the CSV and
+    # in the provenance table, but they do not participate in the tables below.
+    rows = [
+        r for r in all_rows
+        if r.get("run_fingerprint")
+        and r["run_fingerprint"] == current_fps.get(r["name"])
+        and r["name"] not in pending_set
+    ]
     by_name = {r["name"]: r for r in rows}
     out: list[str] = []
     out.append("# Qwen3-4B PD-AF 实验汇总")
@@ -1261,10 +1373,23 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
     out.append(f"- Frontier：`{manifest.get('git', {}).get('short_head', '—')}` "
                f"({manifest.get('git', {}).get('branch', '—')})"
                f"{'，工作树有未提交修改' if manifest.get('git', {}).get('dirty') else ''}")
-    out.append(f"- profile：`{manifest.get('profile', '—')}`；workers={manifest.get('workers', '—')}")
+    if manifest.get("selection_mode", "profile") == "profile":
+        out.append(
+            f"- profile：`{manifest.get('profile_requested', manifest.get('profile', '—'))}`；"
+            f"workers={manifest.get('workers', '—')}"
+        )
+    else:
+        out.append(
+            f"- selection：`{manifest.get('selection_label', '—')}`；"
+            f"workers={manifest.get('workers', '—')}"
+        )
     cancelled = int(manifest.get("num_cancelled", 0) or 0)
+    row_names = {r.get("name") for r in all_rows}
+    pending_in_table = pending_set & row_names
+    historical = max(0, len(all_rows) - len(rows) - len(pending_in_table))
     out.append(
-        f"- 结果 {len(rows)} 条（本次运行 {manifest.get('num_run', '—')}，"
+        f"- 结果 {len(all_rows)} 条（当前源码 {len(rows)}，历史 {historical}，"
+        f"待重跑 {len(pending_set)}；本次运行 {manifest.get('num_run', '—')}，"
         f"缓存 {manifest.get('num_cached', '—')}）；失败 {len(failures)}"
         + (f"；中断取消 {cancelled}" if cancelled else "")
     )
@@ -1279,11 +1404,11 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             [
                 [
                     r["name"],
-                    _fmt(float(r["ttft_mean_ms"])),
-                    _fmt(float(r["tpot_mean_ms"]), 3),
-                    _fmt(float(r["e2e_mean_ms"])),
-                    _fmt(float(r["decode_tokens_per_second"]), 0),
-                    _fmt(float(r.get("wall_seconds", 0)), 1),
+                    _fmt(_to_float(r.get("ttft_mean_ms"))),
+                    _fmt(_to_float(r.get("tpot_mean_ms")), 3),
+                    _fmt(_to_float(r.get("e2e_mean_ms"))),
+                    _fmt(_to_float(r.get("decode_tokens_per_second")), 0),
+                    _fmt(_to_float(r.get("wall_seconds"), 0.0), 1),
                 ]
                 for r in sorted(verify, key=lambda x: x["name"])
             ],
@@ -1296,22 +1421,22 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
         out.append("")
         burst_sorted = sorted(
             burst,
-            key=lambda x: (int(float(x["h200_total_cards"])), -float(x["decode_tokens_per_second"])),
+            key=lambda x: (_to_int(x.get("h200_total_cards"), 0), -_to_float(x.get("decode_tokens_per_second"), 0.0)),
         )
         out.append(_table(
             ["配置", "H200", "P", "D", "AF", "TTFT", "TPOT", "E2E", "输出 tok/s", "tok/s/卡"],
             [
                 [
-                    r["name"],
-                    r["h200_total_cards"],
-                    f"{r['p_rep']}×TP{r['p_tp']}",
-                    f"{r['d_rep']}×TP{r['d_tp']}",
-                    r["af_mb"],
-                    _fmt(float(r["ttft_mean_ms"])),
-                    _fmt(float(r["tpot_mean_ms"]), 3),
-                    _fmt(float(r["e2e_mean_ms"])),
-                    _fmt(float(r["decode_tokens_per_second"]), 0),
-                    _fmt(float(r["decode_tps_per_gpu"]), 0),
+                    r.get("name", "—"),
+                    r.get("h200_total_cards", "—"),
+                    f"{r.get('p_rep', '—')}×TP{r.get('p_tp', '—')}",
+                    f"{r.get('d_rep', '—')}×TP{r.get('d_tp', '—')}",
+                    r.get("af_mb", "—"),
+                    _fmt(_to_float(r.get("ttft_mean_ms"))),
+                    _fmt(_to_float(r.get("tpot_mean_ms")), 3),
+                    _fmt(_to_float(r.get("e2e_mean_ms"))),
+                    _fmt(_to_float(r.get("decode_tokens_per_second")), 0),
+                    _fmt(_to_float(r.get("decode_tps_per_gpu")), 0),
                 ]
                 for r in burst_sorted
             ],
@@ -1326,20 +1451,20 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             ["配置", "H200", "P", "D（副本×TP×PP）", "AF", "TTFT", "TPOT", "E2E", "输出 tok/s", "说明"],
             [
                 [
-                    r["name"],
-                    r["h200_total_cards"],
-                    f"{r['p_rep']}×TP{r['p_tp']}",
-                    f"{r['d_rep']}×TP{r['d_tp']}×PP{r.get('attn_pp', 1)}",
-                    r["af_mb"],
-                    _fmt(float(r["ttft_mean_ms"])),
-                    _fmt(float(r["tpot_mean_ms"]), 3),
-                    _fmt(float(r["e2e_mean_ms"])),
-                    _fmt(float(r["decode_tokens_per_second"]), 0),
+                    r.get("name", "—"),
+                    r.get("h200_total_cards", "—"),
+                    f"{r.get('p_rep', '—')}×TP{r.get('p_tp', '—')}",
+                    f"{r.get('d_rep', '—')}×TP{r.get('d_tp', '—')}×PP{_to_int(r.get('attn_pp'), 1)}",
+                    r.get("af_mb", "—"),
+                    _fmt(_to_float(r.get("ttft_mean_ms"))),
+                    _fmt(_to_float(r.get("tpot_mean_ms")), 3),
+                    _fmt(_to_float(r.get("e2e_mean_ms"))),
+                    _fmt(_to_float(r.get("decode_tokens_per_second")), 0),
                     r.get("note", ""),
                 ]
                 for r in sorted(
                     attn_parallel,
-                    key=lambda x: (int(float(x["h200_total_cards"])), -float(x["decode_tokens_per_second"])),
+                    key=lambda x: (_to_int(x.get("h200_total_cards"), 0), -_to_float(x.get("decode_tokens_per_second"), 0.0)),
                 )
             ],
         ))
@@ -1351,18 +1476,18 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
         out.append("")
         poi_sorted = sorted(
             poisson,
-            key=lambda x: (x["name"].split("_qps")[0], float(x["qps"])),
+            key=lambda x: (x["name"].split("_qps")[0], _to_float(x.get("qps"), 0.0)),
         )
         out.append(_table(
             ["配置", "QPS", "TTFT", "TPOT", "E2E", "输出 tok/s", "完成请求"],
             [
                 [
                     r["name"],
-                    _fmt(float(r["qps"]), 0),
-                    _fmt(float(r["ttft_mean_ms"])),
-                    _fmt(float(r["tpot_mean_ms"]), 3),
-                    _fmt(float(r["e2e_mean_ms"])),
-                    _fmt(float(r["decode_tokens_per_second"]), 0),
+                    _fmt(_to_float(r.get("qps")), 0),
+                    _fmt(_to_float(r.get("ttft_mean_ms"))),
+                    _fmt(_to_float(r.get("tpot_mean_ms")), 3),
+                    _fmt(_to_float(r.get("e2e_mean_ms"))),
+                    _fmt(_to_float(r.get("decode_tokens_per_second")), 0),
                     r.get("completed_requests", "—"),
                 ]
                 for r in poi_sorted
@@ -1378,14 +1503,14 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             ["配置", "协议", "带宽 Gbps", "延迟 us", "M2N ms", "TPOT", "E2E", "输出 tok/s"],
             [
                 [
-                    r["name"],
-                    r["comm_label"],
-                    _fmt(float(r["m2n_bw_gbps"]), 0),
-                    _fmt(float(r["m2n_latency_ms"]) * 1000.0, 0),
-                    _fmt(float(r["m2n_total_ms"])),
-                    _fmt(float(r["tpot_mean_ms"]), 3),
-                    _fmt(float(r["e2e_mean_ms"])),
-                    _fmt(float(r["decode_tokens_per_second"]), 0),
+                    r.get("name", "—"),
+                    r.get("comm_label", "—"),
+                    _fmt(_to_float(r.get("m2n_bw_gbps")), 0),
+                    _fmt(_to_float(r.get("m2n_latency_ms")) * 1000.0, 0),
+                    _fmt(_to_float(r.get("m2n_total_ms"))),
+                    _fmt(_to_float(r.get("tpot_mean_ms")), 3),
+                    _fmt(_to_float(r.get("e2e_mean_ms"))),
+                    _fmt(_to_float(r.get("decode_tokens_per_second")), 0),
                 ]
                 for r in sorted(m2n, key=lambda x: x["name"])
             ],
@@ -1400,14 +1525,14 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             ["配置", "流式层数", "FFN 副本", "AF", "TTFT", "TPOT", "E2E", "输出 tok/s"],
             [
                 [
-                    r["name"],
-                    r["weight_stream_layers"],
-                    r["f_rep"],
-                    r["af_mb"],
-                    _fmt(float(r["ttft_mean_ms"])),
-                    _fmt(float(r["tpot_mean_ms"]), 3),
-                    _fmt(float(r["e2e_mean_ms"])),
-                    _fmt(float(r["decode_tokens_per_second"]), 0),
+                    r.get("name", "—"),
+                    r.get("weight_stream_layers", "—"),
+                    r.get("f_rep", "—"),
+                    r.get("af_mb", "—"),
+                    _fmt(_to_float(r.get("ttft_mean_ms"))),
+                    _fmt(_to_float(r.get("tpot_mean_ms")), 3),
+                    _fmt(_to_float(r.get("e2e_mean_ms"))),
+                    _fmt(_to_float(r.get("decode_tokens_per_second")), 0),
                 ]
                 for r in sorted(stream, key=lambda x: x["name"])
             ],
@@ -1423,12 +1548,12 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             [
                 [
                     r["name"],
-                    _fmt(float(r["qps"]), 0),
+                    _fmt(_to_float(r.get("qps")), 0),
                     r.get("completed_requests", "—"),
-                    _fmt(float(r["ttft_mean_ms"])),
-                    _fmt(float(r["tpot_mean_ms"]), 3),
-                    _fmt(float(r["e2e_mean_ms"])),
-                    _fmt(float(r["decode_tokens_per_second"]), 0),
+                    _fmt(_to_float(r.get("ttft_mean_ms"))),
+                    _fmt(_to_float(r.get("tpot_mean_ms")), 3),
+                    _fmt(_to_float(r.get("e2e_mean_ms"))),
+                    _fmt(_to_float(r.get("decode_tokens_per_second")), 0),
                 ]
                 for r in sorted(online, key=lambda x: x["name"])
             ],
@@ -1458,10 +1583,10 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             continue
         key_rows.append([
             label,
-            _fmt(float(r["ttft_mean_ms"])),
-            _fmt(float(r["tpot_mean_ms"]), 3),
-            _fmt(float(r["e2e_mean_ms"])),
-            _fmt(float(r["decode_tokens_per_second"]), 0),
+            _fmt(_to_float(r.get("ttft_mean_ms"))),
+            _fmt(_to_float(r.get("tpot_mean_ms")), 3),
+            _fmt(_to_float(r.get("e2e_mean_ms"))),
+            _fmt(_to_float(r.get("decode_tokens_per_second")), 0),
         ])
     if key_rows:
         out.append("## 关键对照")
@@ -1469,22 +1594,17 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
         out.append(_table(["配置", "TTFT ms", "TPOT ms", "E2E ms", "输出 tok/s"], key_rows))
         out.append("")
 
-    current_fps = {
-        e.get("name"): e.get("run_fingerprint")
-        for e in manifest.get("experiments", [])
-        if isinstance(e, dict) and e.get("name")
-    }
-    if rows:
+    if all_rows:
         out.append("## 数据来源")
         out.append("")
         provenance_rows = []
-        for r in rows:
+        for r in all_rows:
             name = r.get("name", "—")
             fp = r.get("run_fingerprint")
-            if not fp:
+            if name in pending_set:
+                state = "待重跑"
+            elif not fp:
                 state = "无指纹"
-            elif name not in current_fps:
-                state = "未选"
             elif fp == current_fps.get(name):
                 state = "当前"
             else:
@@ -1501,7 +1621,7 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             provenance_rows,
         ))
         stale_count = sum(
-            1 for row in provenance_rows if row[4] in ("旧/不匹配", "无指纹")
+            1 for row in provenance_rows if row[4] in ("旧/不匹配", "无指纹", "待重跑")
         )
         if stale_count:
             out.append("")
@@ -1509,6 +1629,14 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
                 f"> 注意：本表包含 {stale_count} 条旧源码或无指纹结果，"
                 "不要把它们当作当前模拟器产物。"
             )
+        out.append("")
+
+    pending_only = sorted(pending_set - row_names)
+    if pending_only:
+        out.append("## 待重跑（尚无成功结果）")
+        out.append("")
+        for name in pending_only:
+            out.append(f"- `{name}`")
         out.append("")
 
     if failures:
@@ -1526,18 +1654,92 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
 # ---------------------------------------------------------------------------
 
 
-def resolve_output_dir(path: Path | None) -> Path:
-    """Resolve --output-dir: relative paths live under outputs/runs."""
+class OutputDirLock:
+    """Exclusive inter-process lock for one output directory.
+
+    The lock covers the whole read-checkpoint -> run -> publish cycle.  Without
+    it, two runners on the same directory would each replace the CSV from their
+    own stale snapshot and one process would silently lose the other's rows.
+    """
+
+    def __init__(self, output_dir: Path) -> None:
+        self.path = output_dir / ".sweep.lock"
+        self._fh = None
+        self._locked = False
+
+    def acquire(self) -> "OutputDirLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("a+", encoding="utf-8")
+        if fcntl is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(f"等待输出目录锁：{self.path}", flush=True)
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            self._locked = True
+        elif msvcrt is not None:  # pragma: no cover - Windows
+            self._fh.seek(0)
+            self._fh.write(" ")
+            self._fh.flush()
+            while True:
+                try:
+                    self._fh.seek(0)
+                    msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    self._locked = True
+                    break
+                except OSError:
+                    time.sleep(0.2)
+        return self
+
+    def release(self) -> None:
+        if self._fh is None:
+            return
+        try:
+            if self._locked and fcntl is not None:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            elif self._locked and msvcrt is not None:  # pragma: no cover - Windows
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self._fh.close()
+            self._fh = None
+            self._locked = False
+
+
+def _create_unique_run_dir(commit: str) -> Path:
+    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for attempt in range(1000):
+        suffix = "" if attempt == 0 else f"_{attempt + 1}"
+        candidate = RUNS_ROOT / f"{stamp}_{commit}{suffix}"
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"无法为 {stamp}_{commit} 创建唯一输出目录")
+
+
+def resolve_output_dir(path: Path | None, *, create: bool) -> Path:
+    """Resolve --output-dir: relative paths live under outputs/runs.
+
+    Default runs use an exclusively-created timestamp/commit directory so two
+    processes started in the same second cannot collide.  Explicit directories
+    are created if needed and serialized by OutputDirLock in main().
+    """
     if path is None:
         commit = git_info()["short_head"] or "nogit"
+        if create:
+            return _create_unique_run_dir(commit)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return RUNS_ROOT / f"{stamp}_{commit}"
-    if path.is_absolute():
-        return path.resolve()
-    return (RUNS_ROOT / path).resolve()
+    resolved = path.resolve() if path.is_absolute() else (RUNS_ROOT / path).resolve()
+    if create:
+        resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
 
 
-def preflight(profile: str, stages: set[str], selected: list[Experiment]) -> None:
+def preflight(selection_label: str, stages: set[str], selected: list[Experiment]) -> None:
     errors: list[str] = []
     if not (REPO_ROOT / ".git").exists():
         errors.append(f"Frontier 不是 git 仓库：{REPO_ROOT}")
@@ -1591,7 +1793,7 @@ def preflight(profile: str, stages: set[str], selected: list[Experiment]) -> Non
     print(f"  Frontier : {REPO_ROOT}")
     print(f"  commit   : {git['short_head']} ({git['branch']})")
     print(f"  dirty    : {git['dirty']}")
-    print(f"  profile  : {profile}")
+    print(f"  selection: {selection_label}")
     print(f"  stages   : {', '.join(sorted(stages))}")
     print(f"  Python   : {sys.executable} ({platform.python_version()})")
     if git["branch"] != "qwen3-4b-pd-af-simulator":
@@ -1648,7 +1850,7 @@ def select_configs(args: argparse.Namespace) -> list[Experiment]:
 
 
 def main() -> int:
-    global OUT_ROOT, METRICS_ROOT, LOGS_ROOT, RESULTS_CSV
+    global OUT_ROOT, METRICS_ROOT, ATTEMPTS_ROOT, RESULTS_CSV
     parser = argparse.ArgumentParser(
         description="Qwen3-4B PD-AF 一键实验脚本（Frontier 工作树，支持断点续跑）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1686,6 +1888,21 @@ def main() -> int:
         print("没有匹配的实验。用 --list 查看配置。")
         return 0
 
+    if args.suite:
+        selection_mode = "suite"
+        selection_label = f"suite={args.suite}"
+    elif args.stage:
+        selection_mode = "stage"
+        selection_label = "stages=" + ",".join(args.stage)
+    elif args.name:
+        selection_mode = "name"
+        selection_label = f"names={len(args.name)}"
+    else:
+        selection_mode = "profile"
+        selection_label = f"profile={args.profile}"
+    if args.name and selection_mode != "name":
+        selection_label += f"; names={len(args.name)}"
+
     experimental = [c for c in selected if c.tier == "experimental" or c.attn_pp > 1]
     if experimental:
         print(
@@ -1698,7 +1915,7 @@ def main() -> int:
         counts: dict[str, int] = {}
         for c in selected:
             counts[c.stage] = counts.get(c.stage, 0) + 1
-        print(f"profile={args.profile}  selected={len(selected)}")
+        print(f"selection={selection_label}  selected={len(selected)}")
         for stage, count in sorted(counts.items()):
             print(f"  {stage:22s}: {count}")
         for c in selected:
@@ -1707,13 +1924,12 @@ def main() -> int:
         return 0
 
     stages = {c.stage for c in selected}
-    preflight(args.profile, stages, selected)
+    preflight(selection_label, stages, selected)
 
     if args.dry_run:
-        preview_dir = resolve_output_dir(args.output_dir)
+        preview_dir = resolve_output_dir(args.output_dir, create=False)
         OUT_ROOT = preview_dir / "outputs"
         METRICS_ROOT = OUT_ROOT / "qwen3_4b" / "offline_batch"
-        LOGS_ROOT = preview_dir / "logs"
         RESULTS_CSV = preview_dir / "sweep_results.csv"
         print(f"\n将执行 {len(selected)} 个配置（dry-run，不创建目录）：")
         for c in selected:
@@ -1722,16 +1938,35 @@ def main() -> int:
         print(" ".join(build_command(selected[0])))
         return 0
 
-    output_dir = resolve_output_dir(args.output_dir)
+    output_dir = resolve_output_dir(args.output_dir, create=True)
 
     OUT_ROOT = output_dir / "outputs"
     METRICS_ROOT = OUT_ROOT / "qwen3_4b" / "offline_batch"
-    LOGS_ROOT = output_dir / "logs"
+    ATTEMPTS_ROOT = output_dir / "attempts"
     RESULTS_CSV = output_dir / "sweep_results.csv"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
-    LOGS_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        lock = OutputDirLock(output_dir).acquire()
+    except KeyboardInterrupt:
+        print("\n等待目录锁时收到 Ctrl-C，退出。", file=sys.stderr)
+        return 130
+    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    run_manifest_path = output_dir / "manifests" / f"{run_id}.json"
+    run_summary_path = output_dir / "summaries" / f"{run_id}.md"
+    run_commands_path = output_dir / "commands" / f"{run_id}.txt"
+    pending_dir = output_dir / "pending"
+    for parent in (
+        run_manifest_path.parent,
+        run_summary_path.parent,
+        run_commands_path.parent,
+        pending_dir,
+    ):
+        parent.mkdir(parents=True, exist_ok=True)
+
+    def pending_path(exp: Experiment) -> Path:
+        return pending_dir / f"{exp.name}.json"
 
     # Results are reusable only when both the experiment config and the
     # working-tree identity match.  A new commit or an uncommitted simulator
@@ -1739,13 +1974,17 @@ def main() -> int:
     CANCEL_EVENT.clear()
     git = git_info()
     source = current_source(git)
+    all_cfgs = build_all_configs()
+    all_run_fps = {c.name: run_fingerprint(c, source) for c in all_cfgs}
     config_fps = {c.name: config_fingerprint(c) for c in selected}
-    run_fps = {c.name: run_fingerprint(c, source) for c in selected}
+    run_fps = {c.name: all_run_fps[c.name] for c in selected}
 
     existing = load_existing(RESULTS_CSV)
     rows_by_name: dict[str, dict[str, Any]] = dict(existing)
 
     def cache_state(exp: Experiment) -> str:
+        if pending_path(exp).exists():
+            return "pending"
         row = rows_by_name.get(exp.name)
         if row is None:
             return "missing"
@@ -1757,7 +1996,19 @@ def main() -> int:
     manifest: dict[str, Any] = {
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "finished_at": None,
-        "profile": args.profile,
+        "run_id": run_id,
+        "run_manifest": str(run_manifest_path),
+        "run_summary": str(run_summary_path),
+        "run_commands": str(run_commands_path),
+        "profile": None if selection_mode != "profile" else args.profile,
+        "profile_requested": args.profile,
+        "selection_mode": selection_mode,
+        "selection_label": selection_label,
+        "suite": args.suite,
+        "stage_filters": list(args.stage),
+        "name_filters": list(args.name),
+        "include_experimental": bool(args.include_experimental),
+        "force": bool(args.force),
         "stages": sorted(stages),
         "workers": args.workers,
         "timeout_s": args.timeout,
@@ -1768,10 +2019,13 @@ def main() -> int:
         "output_dir": str(output_dir),
         "git": git,
         "source": source,
+        "current_fingerprints": all_run_fps,
         "num_selected": len(selected),
         "num_run": len(to_run),
         "num_cached": len(selected) - len(to_run),
         "num_stale": 0 if args.force else len(stale),
+        "pending": [],
+        "num_pending": 0,
         "num_ok": 0,
         "num_failed": 0,
         "num_cancelled": 0,
@@ -1787,11 +2041,12 @@ def main() -> int:
         ],
     }
     manifest_path = output_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-    (output_dir / "commands.txt").write_text(
-        "\n\n".join(" ".join(build_command(c)) for c in selected),
-        encoding="utf-8",
-    )
+    manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
+    manifest_path.write_text(manifest_text, encoding="utf-8")
+    run_manifest_path.write_text(manifest_text, encoding="utf-8")
+    commands_text = "\n\n".join(" ".join(build_command(c)) for c in selected)
+    (output_dir / "commands.txt").write_text(commands_text, encoding="utf-8")
+    run_commands_path.write_text(commands_text, encoding="utf-8")
 
     def ordered_rows() -> list[dict[str, Any]]:
         ordered = [rows_by_name[c.name] for c in selected if c.name in rows_by_name]
@@ -1804,6 +2059,9 @@ def main() -> int:
     print(f"配置数   : {len(selected)}（缓存 {len(selected) - len(to_run)}，待跑 {len(to_run)}）")
     if stale and not args.force:
         print(f"旧结果   : {len(stale)} 个源码/配置指纹不匹配，将重跑")
+    pending_before = [c for c in selected if pending_path(c).exists()]
+    if pending_before:
+        print(f"待重跑   : {len(pending_before)} 个上次中断/失败未完成")
     print(f"workers  : {args.workers}")
     print()
 
@@ -1811,6 +2069,18 @@ def main() -> int:
     ok_names: set[str] = set()
     done = 0
     interrupted = False
+    # Mark every selected attempt before launching it.  If this process is
+    # interrupted or dies, the old row is not treated as current on the next
+    # resume; the run is retried instead.
+    for exp in to_run:
+        pending_path(exp).write_text(
+            json.dumps(
+                {"run_fingerprint": run_fps[exp.name], "run_id": run_id},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
     t_start = time.time()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
     futures = {
@@ -1836,6 +2106,7 @@ def main() -> int:
                 rows_by_name[name] = row
                 ok_names.add(name)
                 save_csv(ordered_rows(), RESULTS_CSV)
+                pending_path(exp).unlink(missing_ok=True)
                 print(
                     f"[{done}/{len(to_run)}] OK   {name:46s} ({elapsed:6.1f}s) | "
                     f"TTFT={row['ttft_mean_ms']:7.2f}ms TPOT={row['tpot_mean_ms']:6.3f}ms "
@@ -1857,6 +2128,15 @@ def main() -> int:
 
     ordered = ordered_rows()
     save_csv(ordered, RESULTS_CSV)
+    pending_names = sorted(p.stem for p in pending_dir.glob("*.json"))
+    pending_set = set(pending_names)
+    current_rows = [
+        r for r in ordered
+        if r.get("run_fingerprint") == all_run_fps.get(r["name"])
+        and r["name"] not in pending_set
+    ]
+    current_csv = output_dir / "current_results.csv"
+    save_csv(current_rows, current_csv)
 
     num_cancelled = max(0, len(to_run) - len(ok_names) - len(failures))
     manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
@@ -1865,12 +2145,19 @@ def main() -> int:
     manifest["num_cancelled"] = num_cancelled if interrupted else 0
     manifest["interrupted"] = interrupted
     manifest["num_results"] = len(ordered)
+    manifest["num_current_results"] = len(current_rows)
+    manifest["pending"] = pending_names
+    manifest["num_pending"] = len(pending_names)
+    manifest["current_results_csv"] = str(current_csv)
     manifest["failures"] = [{"name": n, "error": e} for n, e in failures]
     manifest["elapsed_s"] = round(time.time() - t_start, 1)
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    manifest_text = json.dumps(manifest, indent=2, ensure_ascii=False)
+    manifest_path.write_text(manifest_text, encoding="utf-8")
+    run_manifest_path.write_text(manifest_text, encoding="utf-8")
 
     summary_path = output_dir / "summary.md"
     write_summary(ordered, summary_path, manifest, failures)
+    write_summary(ordered, run_summary_path, manifest, failures)
 
     print()
     print(
@@ -1878,9 +2165,11 @@ def main() -> int:
         f"{manifest['num_cancelled']} 取消；"
         f"目录共 {len(ordered)} 条结果（缓存 {len(selected) - len(to_run)}）"
     )
-    print(f"结果 CSV : {RESULTS_CSV}")
+    print(f"全部结果 : {RESULTS_CSV}")
+    print(f"当前源码 : {current_csv}")
     print(f"汇总报告 : {summary_path}")
     print(f"运行清单 : {manifest_path}")
+    lock.release()
     if interrupted:
         return 130
     if failures:

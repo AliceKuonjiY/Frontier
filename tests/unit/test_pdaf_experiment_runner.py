@@ -102,6 +102,118 @@ def test_preflight_rejects_missing_streamed_cpu_overhead_table(
         runner.preflight("core", {exp.stage}, [exp])
 
 
+def test_summary_handles_na_and_empty_numeric_fields(tmp_path: Path) -> None:
+    rows = [
+        {
+            "name": "case",
+            "stage": "verify",
+            "run_fingerprint": "fp",
+            "ttft_mean_ms": "NA",
+            "tpot_mean_ms": "",
+            "e2e_mean_ms": "NA",
+            "decode_tokens_per_second": "NA",
+            "wall_seconds": "",
+        }
+    ]
+    manifest = {
+        "current_fingerprints": {"case": "fp"},
+        "pending": [],
+        "experiments": [],
+        "selection_mode": "profile",
+        "profile_requested": "core",
+        "git": {},
+        "workers": 1,
+        "num_run": 0,
+        "num_cached": 1,
+        "num_cancelled": 0,
+    }
+    out = tmp_path / "summary.md"
+    runner.write_summary(rows, out, manifest, [])
+    text = out.read_text()
+    assert "NaN" in text
+    assert "case" in text
+
+
+def test_synthetic_generator_seed_changes_arrivals() -> None:
+    from frontier.config.request_generator_config import (
+        FixedRequestLengthGeneratorConfig,
+        PoissonRequestIntervalGeneratorConfig,
+        SyntheticRequestGeneratorConfig,
+    )
+    from frontier.request_generator.synthetic_request_generator import (
+        SyntheticRequestGenerator,
+    )
+
+    def arrivals(seed: int) -> list[float]:
+        cfg = SyntheticRequestGeneratorConfig(
+            seed=seed,
+            num_requests=8,
+            interval_generator_config=PoissonRequestIntervalGeneratorConfig(
+                qps=250, seed=seed
+            ),
+            length_generator_config=FixedRequestLengthGeneratorConfig(
+                prefill_tokens=512, decode_tokens=64, seed=seed
+            ),
+        )
+        requests = SyntheticRequestGenerator(cfg).generate_requests()
+        return [round(request.arrived_at, 9) for request in requests]
+
+    assert arrivals(1) == arrivals(1)
+    assert arrivals(1) != arrivals(2)
+
+
+def test_build_command_passes_synthetic_seed() -> None:
+    exp = _experiment("online_g16_p8d8_tp2_qps250_req400_seed3")
+    cmd = runner.build_command(exp)
+    idx = cmd.index("--synthetic_request_generator_config_seed")
+    assert cmd[idx + 1] == "3"
+    idx = cmd.index("--poisson_request_interval_generator_config_seed")
+    assert cmd[idx + 1] == "3"
+
+
+def test_default_output_dirs_are_unique(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "RUNS_ROOT", tmp_path)
+    first = runner.resolve_output_dir(None, create=True)
+    second = runner.resolve_output_dir(None, create=True)
+    assert first != second
+    assert first.is_dir() and second.is_dir()
+
+
+def test_run_one_terminates_if_cancel_arrives_during_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "ATTEMPTS_ROOT", tmp_path / "attempts")
+    monkeypatch.setattr(runner, "METRICS_ROOT", tmp_path / "metrics")
+    terminated: list[object] = []
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs) -> None:
+            self.pid = 12345
+            runner.CANCEL_EVENT.set()
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            raise AssertionError("run_one must not wait after cancellation")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(runner, "_terminate_proc", lambda proc: terminated.append(proc))
+
+    try:
+        name, row, err, _ = runner.run_one(
+            _experiment(), 1, _source(), "fingerprint"
+        )
+    finally:
+        runner.CANCEL_EVENT.clear()
+        runner._RUNNING_PROCS.clear()
+
+    assert (name, row, err) == ("g16_p8_d8_tp2", None, "cancelled")
+    assert len(terminated) == 1
+
+
 def test_run_one_honours_cancellation_before_spawn() -> None:
     runner.CANCEL_EVENT.set()
     try:

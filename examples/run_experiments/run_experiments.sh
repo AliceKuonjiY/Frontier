@@ -9,7 +9,7 @@
 #   ./run_experiments.sh --dry-run               # 只打印命令
 #
 # 环境变量：
-#   PYTHON_BIN   指定 Python 解释器
+#   PYTHON_BIN   显式指定 Python 解释器或 PATH 中的命令名
 #   OMP_NUM_THREADS / OPENBLAS_NUM_THREADS  默认 2
 #   PROFILE      默认 profile（等价于 --profile）
 
@@ -18,50 +18,59 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # examples/run_experiments -> examples -> Frontier
 FRONTIER_ROOT="$(cd "$HERE/../.." && pwd)"
-WORKSPACE_ROOT="$(cd "$FRONTIER_ROOT/.." && pwd)"
 
 if [ ! -d "$FRONTIER_ROOT/frontier" ]; then
   echo "ERROR: 找不到 Frontier 工作树：$FRONTIER_ROOT" >&2
   exit 2
 fi
 
-find_python() {
-  local candidates=()
-  [ -n "${PYTHON_BIN:-}" ] && candidates+=("$PYTHON_BIN")
-  candidates+=(
-    "$WORKSPACE_ROOT/.venv/bin/python"
-    "$FRONTIER_ROOT/.venv/bin/python"
-  )
-  if command -v python3 >/dev/null 2>&1; then
-    candidates+=("$(command -v python3)")
-  fi
-
-  local py
-  for py in "${candidates[@]}"; do
-    [ -n "$py" ] || continue
-    [ -x "$py" ] || continue
-    if "$py" -c 'import sklearn, pandas, numpy, scipy' >/dev/null 2>&1; then
-      echo "$py"
-      return 0
-    fi
-  done
-  return 1
+check_python() {
+  local out
+  out="$("$1" -c 'import sys, sklearn, pandas, numpy, scipy; assert sys.version_info >= (3, 10); print("ok")' 2>/dev/null)" || return 1
+  [ "$out" = "ok" ]
 }
 
-PY="$(find_python || true)"
-if [ -z "$PY" ]; then
-  cat >&2 <<'EOF'
+if [ -n "${PYTHON_BIN:-}" ]; then
+  # An explicit PYTHON_BIN is authoritative: resolve PATH names, validate it,
+  # and fail loudly instead of silently falling back to another interpreter.
+  if command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    PY="$(command -v "$PYTHON_BIN")"
+  elif [ -x "$PYTHON_BIN" ]; then
+    PY="$PYTHON_BIN"
+  else
+    echo "ERROR: PYTHON_BIN 不是可执行命令或文件：$PYTHON_BIN" >&2
+    exit 2
+  fi
+  if ! check_python "$PY"; then
+    echo "ERROR: PYTHON_BIN=$PYTHON_BIN 缺少依赖（sklearn/pandas/numpy/scipy）" >&2
+    exit 2
+  fi
+else
+  # Only the repository's own venv and the system python3 are auto-probed.
+  # Do not execute a .venv from an external parent directory.
+  PY=""
+  for candidate in "$FRONTIER_ROOT/.venv/bin/python" "$(command -v python3 || true)"; do
+    [ -n "$candidate" ] || continue
+    [ -x "$candidate" ] || continue
+    if check_python "$candidate"; then
+      PY="$candidate"
+      break
+    fi
+  done
+  if [ -z "$PY" ]; then
+    cat >&2 <<'EOF'
 ERROR: 没有找到带依赖的 Python。
 
-请先创建 uv 虚拟环境：
+请先创建仓库内的 uv 虚拟环境：
   cd Frontier
   uv venv .venv
   uv pip install --python .venv/bin/python -e .
 
-或指定已有解释器：
+或通过 PYTHON_BIN 显式指定一个已安装依赖的解释器：
   PYTHON_BIN=/path/to/python ./run_experiments.sh
 EOF
-  exit 2
+    exit 2
+  fi
 fi
 
 export PYTHONPATH="$FRONTIER_ROOT${PYTHONPATH:+:$PYTHONPATH}"
