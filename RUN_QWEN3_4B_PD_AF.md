@@ -64,8 +64,14 @@ RUN_ID=my_run bash examples/architecture/pd-af-disagg/offline/qwen3_4b_pd_af.sh
 PYTHON_BIN=.venv/bin/python ARRIVAL_PATTERN=poisson QPS=1 RUN_ID=poisson1 \
 bash examples/architecture/pd-af-disagg/offline/qwen3_4b_pd_af.sh
 
-# 0 = 36 层 FFN 全部常驻；1/2/3 = 流式对应层数
+# 默认 WEIGHT_STREAM_LAYERS=2（严格二进制 170 MiB 可用 + 10 MiB overhead 下最小可行档位）；
+# 2/3 可行，0/1 默认 fail fast
 PYTHON_BIN=.venv/bin/python WEIGHT_STREAM_LAYERS=3 RUN_ID=stream3 \
+bash examples/architecture/pd-af-disagg/offline/qwen3_4b_pd_af.sh
+
+# 仅诊断对照：显式放宽预算为名义 192 MiB / 0 overhead 运行全常驻（会输出 WARNING）
+PYTHON_BIN=.venv/bin/python WEIGHT_STREAM_LAYERS=0 \
+HPP2_USABLE_MEMORY_MB=192 HPP2_PLANNING_OVERHEAD_MB=0 RUN_ID=diag_stream0 \
 bash examples/architecture/pd-af-disagg/offline/qwen3_4b_pd_af.sh
 ```
 
@@ -79,6 +85,8 @@ outputs/qwen3-4b-pd-af/qwen3_4b/offline_batch/<RUN_ID>/
 ```
 
 ## Baseline 结果（8 个请求同时到达，每个输入 512、输出 64 个 token）
+
+> **SRAM 预算口径说明（Issue #7）**：HPP2 单 Die 物理 APC DM 为 `192 MiB`（`201.33 MB`），SCALE 运行时固定保留 `22 MiB` 后可用上限为 **`170 MiB`**（`178.26 MB`），预留 **`10 MiB`**（4×80 KiB Bank0 碎片/规划余量）后有效权重+暂存+激活预算为 **`160 MiB`**（`167.77 MB`）。因此 `WEIGHT_STREAM_LAYERS=0/1` 均不可行（默认 fail fast），最小可行配置为 **`WEIGHT_STREAM_LAYERS=2`**（脚本当前默认值），`WEIGHT_STREAM_LAYERS=3` 亦可行。下方保留的 `stream-0` 数据仅为 Issue #7 修正前的历史理论对照，新版 `stream-2` baseline 与配比结果待后续统一重跑更新。
 
 默认 `ARRIVAL_PATTERN=burst` 让所有请求在时刻 0 到达，该模式下 `QPS` 不参与调度。下面两组权重策略沿用 PR #1 的 P→A NVLink 参考参数（3172.5 Gbit/s，启动延迟 0.0208 ms）。比较 GPU 与 GPU+LPU 时，两端应使用相同的到达序列和请求长度。
 
@@ -131,10 +139,11 @@ DECODE_FFN E2E    47.830 ms / 63 个后续 decode step
 
 ## 已做的 Frontier 改动
 
-1. **HPP2 device / node SKU**
-   - `DeviceSKUType.HPP2`、`HPP2DeviceSKUConfig`（每 die 192 MiB APC DM，
-     380 TFLOPS FP16）。
+1. **HPP2 device / node SKU 与 SRAM 预算口径**
+   - `DeviceSKUType.HPP2`、`HPP2DeviceSKUConfig`（每 die 名义 `192 MiB` APC DM、SCALE 可用 `usable_memory_mb=170.0` MiB、`planning_overhead_mb=10.0` MiB，380 TFLOPS FP16）。
    - `NodeSKUType.HPP2_16RANK`，8 卡 = 16 rank。
+   - `ReplicaConfig` 与 `ClusterConfig`（`decode_ffn`）支持显式覆盖 `usable_memory_mb` / `planning_overhead_mb`（均为二进制 MiB = $1024^2$ 字节，与 `total_memory_gb` 二进制 GiB 保持一致）。
+   - `MemoryPlanner` 与 `qwen3_4b_pd_af.sh` 默认按 `170 MiB` 可用 + `10 MiB` overhead 执行 fail-fast 检查，并读取 `linear_op_kernel_only.csv` 中的 `sram_fit_with_10mb_overhead` / `weight_streaming_required`；TP16 下 `stream-0/1`（`160.31 MiB + 10 MiB = 170.31 MiB > 170 MiB`）被拒绝，`stream-2`（`155.86 + 10 = 165.86 MiB`，余 `4.14 MiB`）与 `stream-3`（`151.41 + 10 = 161.41 MiB`，余 `8.59 MiB`）可行。仅当用户显式放宽 `usable_memory_mb` / `planning_overhead_mb` 时允许以诊断模式运行并打印 `WARNING`。
 
 2. **混合精度 profiling 元数据**
    - 新增可选 CSV 列 `profiling_precision_by_op`。
@@ -155,10 +164,11 @@ DECODE_FFN E2E    47.830 ms / 63 个后续 decode step
    - 运行脚本在 `WEIGHT_STREAM_LAYERS=1|2|3` 时保留 `{NETWORK_DEVICE}/{MODEL}`
      路径占位符，确保只有 `hpp2_16rank` 加载流式表。
 
-4. **FP8 常驻权重内存核算**
+4. **FP8 常驻权重与名义/可用双口径内存核算**
    - `ParamCounter` 和 `system_metrics.model_weight_memory` 按配置的 MLP
      权重宽度计算（FP8 为 1 byte），不再固定按 2 bytes。
-   - 在 TP16 配置下，每个 HPP2 rank 的 36 层 FFN 权重共 168,099,840 字节。流式 3 层时，33 层常驻权重占 154,091,520 字节，串行传输另留一个 4,669,440 字节的单层暂存区，两项合计 158,760,960 字节（158.76 MB）。`system_metrics.json` 的 `model_weight_memory.DECODE_FFN.weight_residency` 分别列出常驻、离卡和计划暂存字节数。
+   - 在 TP16 配置下，每个 HPP2 rank 的 36 层 FFN 权重共 168,099,840 字节（`160.31 MiB` / `168.10 MB`）。流式 2 层时，34 层常驻（`151.41 MiB`）+ 1 层暂存（`4.45 MiB`）合计 `155.86 MiB`（`163.43 MB`），加 `10 MiB` planning overhead 为 `165.86 MiB`（余 `4.14 MiB`）；流式 3 层时，33 层常驻（`146.95 MiB`）+ 1 层暂存（`4.45 MiB`）合计 `151.41 MiB`（`158.76 MB`），加 `10 MiB` overhead 为 `161.41 MiB`（余 `8.59 MiB`）。
+   - `system_metrics.json` 的 `model_weight_memory.DECODE_FFN` 同时输出 nominal（`192 MiB`）与 usable（`170 MiB`）口径下的利用率（含 staging buffer 与 +10 MiB overhead），`memory_utilization_percent` 口径为 `resident_plus_buffer / usable`，并通过 `memory_budget`、`weight_residency` 与 `profiling_sram_contract` 完整记录核算分项。`DECODE_FFN` 初始化日志 `[ACTIVATION_MEMORY_CAPACITY]` 同步打印上述全部分项。
 
 5. **HPP2 M2N / CPU overhead 口径**
    - M2N 统一按 **HostBounce 分段** 解释：`p2p_protocol=host_bounce`，`memory_bandwidth_gbps=366` 只计 IB 段；每层 FFN 输入/输出的 PCIe 拷贝由 HPP2 CPU-overhead 表的 `prepare_inputs_e2e` / `process_model_outputs` 按层计。
@@ -180,7 +190,7 @@ DECODE_FFN E2E    47.830 ms / 63 个后续 decode step
 
 - HPP2 FFN 表是 **SOL 理论值**，不是实测；H200 attention/linear 表是
   2026-11-26 实测。
-- 模拟器以每个 die 名义 192 MiB 计算容量，AI Lab 的 FFN 表另列 170 MB 的可用预算。TP16 全常驻时在后一个预算下只余约 1.90 MB。筛选卡数时，FFN 容量规划器会拒绝常驻权重、计划暂存与显式预留已耗尽设备预算的配置；最终能否部署还需核对激活和工作区的实际峰值。
+- 模拟器按每个 HPP2 die 严格二进制 `170 MiB` 可用 + `10 MiB` planning overhead（有效 `160 MiB` = 20 个完整 256 KiB bank，相对名义 `192 MiB` 扣除了 SCALE 运行时保留的 `22 MiB`）执行容量规划。注意上游 `linear_op_kernel_only.csv` 中的 `rank_fp8_weight_mb=168.100` 为十进制 MB（$10^6$ B），而 `sram_headroom_mb=1.900` 混用了十进制权重与 `170`，实际二进制权重为 `160.31 MiB`；在严格二进制 `170 MiB / 10 MiB` 下 `stream-0/1` 不可行、`stream-2/3` 可行。最终能否部署仍需核对激活和工作区的实际峰值。
 - H200 CPU overhead 表没有安装；H200 host 项按 0 计并打 warning。
   HPP2 CPU overhead 已使用。
 - `moe_grouped_gemm`/`moe_*` 的 warning 来自共享默认 MoE 路径；

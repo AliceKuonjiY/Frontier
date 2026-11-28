@@ -13,6 +13,10 @@ from frontier.execution_time_predictor import BaseExecutionTimePredictor
 from frontier.logger import get_cluster_logger
 from frontier.scheduler.replica_stage_scheduler import ReplicaStageScheduler
 from frontier.scheduler.utils.memory_planner import MemoryPlanner
+from frontier.scheduler.utils.sram_budget import (
+    format_decode_ffn_budget_log,
+    resolve_sram_profile_contract_for_cluster,
+)
 from frontier.spec_decode import (
     get_planned_draft_tokens,
     is_spec_decode_enabled,
@@ -62,6 +66,11 @@ class BaseReplicaScheduler(ABC):
         self._admitted_request_capacity = self._get_memory_planner_max_num_seqs(
             replica_scheduler_config
         )
+        sram_profile_contract = resolve_sram_profile_contract_for_cluster(
+            predictor_config=getattr(self._predictor, "_config", None),
+            replica_config=self._replica_config,
+            cluster_type=self._cluster_type,
+        )
         memory_planner = MemoryPlanner(
             replica_config=self._replica_config,
             replica=replica,
@@ -71,6 +80,7 @@ class BaseReplicaScheduler(ABC):
             # Use the largest scheduler-visible batch cap so automatic planning
             # reserves enough fixed state before any KV admission occurs.
             max_num_seqs=self._admitted_request_capacity,
+            sram_profile_contract=sram_profile_contract,
         )
 
         num_blocks_mode = getattr(self._config, "num_blocks_mode", "memory_planner")
@@ -325,24 +335,21 @@ class BaseReplicaScheduler(ABC):
         self._activation_bytes_allocated = 0
         self._activation_memory_capacity_bytes = None
         if self._cluster_type == ClusterType.DECODE_FFN:
-            total_memory_bytes = int(self._replica.total_memory_gb * 1024**3)
-            available_memory_bytes = int(
-                total_memory_bytes * (1 - self._replica.memory_margin_fraction)
+            decode_ffn_budget = memory_planner.get_memory_budget(
+                gpu_memory_utilization=planner_gpu_utilization,
+                non_kv_cache_overhead_bytes=planner_overhead_for_memory_estimation,
             )
-            parameter_memory_bytes = int(
-                memory_planner.get_parameter_memory_per_device_bytes()
-            )
+            memory_planner.validate_decode_ffn_sram_budget(decode_ffn_budget)
             self._activation_memory_capacity_bytes = max(
-                0, available_memory_bytes - parameter_memory_bytes
+                0, decode_ffn_budget.available_memory_bytes
             )
             logger = get_cluster_logger(
                 __name__, self._cluster_type.name if self._cluster_type else None
             )
             logger.info(
-                f"[ACTIVATION_MEMORY_CAPACITY] total_memory_bytes={total_memory_bytes}, "
-                f"available_memory_bytes={available_memory_bytes}, "
-                f"parameter_memory_bytes={parameter_memory_bytes}, "
-                f"activation_capacity_bytes={self._activation_memory_capacity_bytes}"
+                format_decode_ffn_budget_log(
+                    decode_ffn_budget, sram_profile_contract
+                )
             )
 
         logger.info(
@@ -1179,10 +1186,10 @@ class BaseReplicaScheduler(ABC):
             batch: The batch portion assigned to this EP replica
         """
         if self._cluster_type == ClusterType.DECODE_FFN:
-            self._m2n_immediate_batch_queue.append(batch)
             activation_bytes = getattr(batch, "activation_bytes", None)
             if activation_bytes is not None:
                 self.add_activation_memory_bytes(int(activation_bytes))
+            self._m2n_immediate_batch_queue.append(batch)
         else:
             # For non-DECODE_FFN clusters, this method should not be called
             raise ValueError(f"add_batch_to_m2n_queue called on non-DECODE_FFN cluster: {self._cluster_type}")
@@ -1195,6 +1202,20 @@ class BaseReplicaScheduler(ABC):
         if activation_bytes < 0:
             raise ValueError(
                 f"activation_bytes must be non-negative, got {activation_bytes}"
+            )
+        capacity = self._activation_memory_capacity_bytes
+        if capacity is not None and self._activation_bytes_allocated + activation_bytes > capacity:
+            raise FrontierMemoryOOMError(
+                "DECODE_FFN activation bytes exceed remaining SRAM capacity "
+                f"(allocated={self._activation_bytes_allocated} B + "
+                f"incoming={activation_bytes} B > capacity={capacity} B).",
+                reason="insufficient_activation_budget",
+                details={
+                    "cluster_type": ClusterType.DECODE_FFN.name,
+                    "allocated_activation_bytes": self._activation_bytes_allocated,
+                    "incoming_activation_bytes": activation_bytes,
+                    "activation_memory_capacity_bytes": capacity,
+                },
             )
         self._activation_bytes_allocated += activation_bytes
 

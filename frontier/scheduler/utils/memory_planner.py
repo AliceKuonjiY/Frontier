@@ -1,12 +1,21 @@
+import math
 from typing import Optional
 
 from frontier.attention.memory import get_attention_runtime_kv_layout
 from frontier.config import ReplicaConfig
+from frontier.config.device_sku_config import BINARY_GIB_BYTES, BINARY_MIB_BYTES
 from frontier.errors import FrontierMemoryOOMError
 from frontier.entities.replica import Replica
+from frontier.logger import init_logger
+from frontier.scheduler.utils.sram_budget import (
+    DeviceMemoryBudget,
+    SRAMProfileContract,
+)
 from frontier.spec_decode import method_uses_lookahead_slots
 from frontier.types import ClusterType
 from frontier.utils.param_counter import ParamCounter
+
+logger = init_logger(__name__)
 
 
 class MemoryPlanner:
@@ -16,6 +25,7 @@ class MemoryPlanner:
         replica: Replica,
         cluster_type: ClusterType = None,
         max_num_seqs: int | None = None,
+        sram_profile_contract: Optional[SRAMProfileContract] = None,
     ) -> None:
         self._replica_config = replica_config
         self._replica = replica
@@ -23,6 +33,8 @@ class MemoryPlanner:
         if max_num_seqs is not None and int(max_num_seqs) <= 0:
             raise ValueError(f"max_num_seqs must be positive, got={max_num_seqs!r}")
         self._max_num_seqs = None if max_num_seqs is None else int(max_num_seqs)
+        self._sram_profile_contract = sram_profile_contract
+        self._diagnostic_override_warned = False
 
         self._param_counter = ParamCounter(
             replica_config=replica_config,
@@ -33,14 +45,57 @@ class MemoryPlanner:
         self, gpu_memory_utilization: Optional[float]
     ) -> float:
         if gpu_memory_utilization is not None:
-            if gpu_memory_utilization <= 0 or gpu_memory_utilization > 1.0:
+            if (
+                isinstance(gpu_memory_utilization, bool)
+                or not math.isfinite(float(gpu_memory_utilization))
+                or float(gpu_memory_utilization) <= 0
+                or float(gpu_memory_utilization) > 1.0
+            ):
                 raise ValueError(
                     "gpu_memory_utilization must be in (0, 1], "
                     f"got={gpu_memory_utilization!r}"
                 )
-            return gpu_memory_utilization
+            return float(gpu_memory_utilization)
 
-        return 1 - self._replica.memory_margin_fraction
+        if self._replica is not None:
+            raw_margin = self._replica.memory_margin_fraction
+        else:
+            raw_margin = getattr(self._replica_config, "memory_margin_fraction", 0.0)
+        if isinstance(raw_margin, bool) or not math.isfinite(float(raw_margin)):
+            raise ValueError(
+                "memory_margin_fraction must be a finite value in [0, 1), "
+                f"got={raw_margin!r}"
+            )
+        margin = float(raw_margin)
+        if margin < 0.0 or margin >= 1.0:
+            raise ValueError(
+                "memory_margin_fraction must be a finite value in [0, 1), "
+                f"got={raw_margin!r}"
+            )
+        return 1.0 - margin
+
+    def get_nominal_memory_bytes(self) -> int:
+        if self._replica is not None and getattr(self._replica, "total_memory_gb", None) is not None:
+            return int(round(float(self._replica.total_memory_gb) * BINARY_GIB_BYTES))
+        if hasattr(self._replica_config, "get_nominal_memory_bytes"):
+            return int(self._replica_config.get_nominal_memory_bytes())
+        return int(round(float(self._replica_config.device_config.total_memory_gb) * BINARY_GIB_BYTES))
+
+    def get_usable_memory_bytes(self) -> int:
+        if getattr(self._replica_config, "usable_memory_mb", None) is not None:
+            return int(round(float(self._replica_config.usable_memory_mb) * BINARY_MIB_BYTES))
+        dev = getattr(self._replica_config, "device_config", None)
+        if dev is not None and getattr(dev, "usable_memory_mb", None) is not None:
+            return int(round(float(dev.usable_memory_mb) * BINARY_MIB_BYTES))
+        return self.get_nominal_memory_bytes()
+
+    def get_planning_overhead_bytes(self) -> int:
+        if getattr(self._replica_config, "planning_overhead_mb", None) is not None:
+            return int(round(float(self._replica_config.planning_overhead_mb) * BINARY_MIB_BYTES))
+        dev = getattr(self._replica_config, "device_config", None)
+        if dev is not None and getattr(dev, "planning_overhead_mb", None) is not None:
+            return int(round(float(dev.planning_overhead_mb) * BINARY_MIB_BYTES))
+        return 0
 
     def _get_requested_memory_bytes(
         self, gpu_memory_utilization: Optional[float]
@@ -48,7 +103,37 @@ class MemoryPlanner:
         utilization = self._get_effective_gpu_memory_utilization(
             gpu_memory_utilization
         )
-        return int(self._replica.total_memory_gb * 1024**3 * utilization)
+        return int(self.get_usable_memory_bytes() * utilization)
+
+    def get_memory_budget(
+        self,
+        *,
+        gpu_memory_utilization: Optional[float] = None,
+        non_kv_cache_overhead_bytes: int = 0,
+    ) -> DeviceMemoryBudget:
+        utilization = self._get_effective_gpu_memory_utilization(gpu_memory_utilization)
+        usable_bytes = self.get_usable_memory_bytes()
+        staging_buffer_bytes = int(
+            self._param_counter.get_ffn_streaming_buffer_bytes_per_device()
+        )
+        parameter_memory_per_device = int(self._get_parameter_memory_per_device())
+        if parameter_memory_per_device < staging_buffer_bytes:
+            staging_buffer_bytes = 0
+        return DeviceMemoryBudget(
+            nominal_memory_bytes=self.get_nominal_memory_bytes(),
+            usable_memory_bytes=usable_bytes,
+            effective_utilization=utilization,
+            requested_memory_bytes=int(usable_bytes * utilization),
+            resident_weight_bytes=parameter_memory_per_device - staging_buffer_bytes,
+            staging_buffer_bytes=staging_buffer_bytes,
+            planning_overhead_bytes=self.get_planning_overhead_bytes(),
+            non_kv_cache_overhead_bytes=self._validate_non_kv_cache_overhead_bytes(
+                non_kv_cache_overhead_bytes
+            ),
+            streamed_ffn_layers=int(
+                getattr(self._replica_config, "streamed_ffn_layers", 0) or 0
+            ),
+        )
 
     @staticmethod
     def _validate_non_kv_cache_overhead_bytes(
@@ -204,11 +289,13 @@ class MemoryPlanner:
         if page_size == 0 and gdn_state_reservation_bytes == 0:
             return 0
 
-        requested_memory = self._get_requested_memory_bytes(gpu_memory_utilization)
-        parameter_memory_per_device = self._get_parameter_memory_per_device()
-        overhead_bytes = self._validate_non_kv_cache_overhead_bytes(
-            non_kv_cache_overhead_bytes
+        budget = self.get_memory_budget(
+            gpu_memory_utilization=gpu_memory_utilization,
+            non_kv_cache_overhead_bytes=non_kv_cache_overhead_bytes,
         )
+        requested_memory = budget.requested_memory_bytes
+        parameter_memory_per_device = budget.resident_plus_buffer_bytes
+        overhead_bytes = budget.total_overhead_bytes
 
         if parameter_memory_per_device >= requested_memory:
             self._raise_memory_oom(
@@ -218,9 +305,12 @@ class MemoryPlanner:
                     "memory budget."
                 ),
                 details={
+                    "nominal_memory_bytes": budget.nominal_memory_bytes,
+                    "usable_memory_bytes": budget.usable_memory_bytes,
                     "requested_memory_bytes": requested_memory,
                     "parameter_memory_per_device_bytes": parameter_memory_per_device,
-                    "non_kv_cache_overhead_bytes": overhead_bytes,
+                    "planning_overhead_bytes": budget.planning_overhead_bytes,
+                    "non_kv_cache_overhead_bytes": budget.non_kv_cache_overhead_bytes,
                     "block_size": int(block_size),
                 },
             )
@@ -236,9 +326,12 @@ class MemoryPlanner:
                 reason="insufficient_kv_cache_budget",
                 message="No KV cache budget remains after subtracting weights and non-KV overhead.",
                 details={
+                    "nominal_memory_bytes": budget.nominal_memory_bytes,
+                    "usable_memory_bytes": budget.usable_memory_bytes,
                     "requested_memory_bytes": requested_memory,
                     "parameter_memory_per_device_bytes": parameter_memory_per_device,
-                    "non_kv_cache_overhead_bytes": overhead_bytes,
+                    "planning_overhead_bytes": budget.planning_overhead_bytes,
+                    "non_kv_cache_overhead_bytes": budget.non_kv_cache_overhead_bytes,
                     "gdn_state_reservation_bytes": gdn_state_reservation_bytes,
                     "available_kv_cache_memory_bytes": available_kv_cache_memory,
                     "block_size": int(block_size),
@@ -260,10 +353,13 @@ class MemoryPlanner:
                 reason="insufficient_kv_cache_budget",
                 message="Not enough KV cache budget to allocate even one block.",
                 details={
+                    "nominal_memory_bytes": budget.nominal_memory_bytes,
+                    "usable_memory_bytes": budget.usable_memory_bytes,
                     "requested_memory_bytes": requested_memory,
                     "parameter_memory_per_device_bytes": parameter_memory_per_device,
+                    "planning_overhead_bytes": budget.planning_overhead_bytes,
+                    "non_kv_cache_overhead_bytes": budget.non_kv_cache_overhead_bytes,
                     "available_kv_cache_memory_bytes": available_kv_cache_memory,
-                    "non_kv_cache_overhead_bytes": overhead_bytes,
                     "page_size_bytes": int(page_size),
                     "num_full_attention_layers": num_full_attention_layers,
                     "num_gdn_layers": self._get_num_gdn_layers_per_device(),
@@ -272,6 +368,88 @@ class MemoryPlanner:
             )
 
         return num_blocks
+
+    def validate_decode_ffn_sram_budget(self, budget: DeviceMemoryBudget) -> None:
+        contract = self._sram_profile_contract
+        has_relaxed_override = bool(
+            hasattr(self._replica_config, "has_relaxed_memory_budget_override")
+            and self._replica_config.has_relaxed_memory_budget_override()
+        )
+        details: dict[str, object] = {
+            "nominal_memory_bytes": budget.nominal_memory_bytes,
+            "usable_memory_bytes": budget.usable_memory_bytes,
+            "requested_memory_bytes": budget.requested_memory_bytes,
+            "parameter_memory_per_device_bytes": budget.resident_plus_buffer_bytes,
+            "planning_overhead_bytes": budget.planning_overhead_bytes,
+            "non_kv_cache_overhead_bytes": budget.non_kv_cache_overhead_bytes,
+            "available_activation_bytes": budget.available_memory_bytes,
+            "streamed_ffn_layers": budget.streamed_ffn_layers,
+        }
+        if budget.available_memory_bytes <= 0:
+            self._raise_memory_oom(
+                reason="insufficient_activation_budget",
+                message=(
+                    "No memory remains for decode-FFN activations after reserving weights, "
+                    "staging buffer, and planning overhead: "
+                    f"{budget.resident_plus_buffer_bytes / BINARY_MIB_BYTES:.2f} MiB + "
+                    f"{budget.total_overhead_bytes / BINARY_MIB_BYTES:.2f} MiB = "
+                    f"{budget.reserved_with_overhead_bytes / BINARY_MIB_BYTES:.2f} MiB > "
+                    f"requested {budget.requested_memory_bytes / BINARY_MIB_BYTES:.2f} MiB "
+                    f"(usable {budget.usable_memory_bytes / BINARY_MIB_BYTES:.2f} MiB, "
+                    f"nominal {budget.nominal_memory_bytes / BINARY_MIB_BYTES:.2f} MiB, "
+                    f"streamed_ffn_layers={budget.streamed_ffn_layers})."
+                ),
+                details=details,
+            )
+
+        is_all_resident_footprint = (
+            budget.streamed_ffn_layers == 0
+            or (
+                budget.streamed_ffn_layers == 1
+                and budget.staging_buffer_bytes > 0
+            )
+        )
+        csv_blocks_all_resident = (
+            is_all_resident_footprint
+            and contract is not None
+            and contract.rejects_all_resident_for_weight_bytes(
+                self._param_counter.get_mlp_parameter_bytes_per_element()
+            )
+        )
+        if csv_blocks_all_resident and not has_relaxed_override:
+            self._raise_memory_oom(
+                reason="profiling_sram_budget_exceeded",
+                message=(
+                    "Profiling CSV rejects all-resident decode-FFN "
+                    f"(sram_fit_with_10mb_overhead={contract.sram_fit_with_10mb_overhead}, "
+                    f"weight_streaming_required={contract.weight_streaming_required})."
+                ),
+                details=details,
+            )
+
+        if has_relaxed_override and not self._diagnostic_override_warned:
+            dev = self._replica_config.device_config
+            default_avail = (
+                int(dev.get_usable_memory_bytes() * budget.effective_utilization)
+                - budget.resident_plus_buffer_bytes
+                - dev.get_planning_overhead_bytes()
+                - budget.non_kv_cache_overhead_bytes
+            )
+            if csv_blocks_all_resident or default_avail <= 0:
+                self._diagnostic_override_warned = True
+                logger.warning(
+                    "[SRAM_BUDGET_DIAGNOSTIC_OVERRIDE] decode-FFN streamed_ffn_layers=%d "
+                    "runs only via relaxed override (usable=%.2f MiB, overhead=%.2f MiB vs "
+                    "default %.2f / %.2f MiB; csv sram_fit_with_10mb_overhead=%s, "
+                    "weight_streaming_required=%s). Diagnostic-only.",
+                    budget.streamed_ffn_layers,
+                    budget.usable_memory_bytes / BINARY_MIB_BYTES,
+                    budget.planning_overhead_bytes / BINARY_MIB_BYTES,
+                    dev.get_usable_memory_bytes() / BINARY_MIB_BYTES,
+                    dev.get_planning_overhead_bytes() / BINARY_MIB_BYTES,
+                    contract.sram_fit_with_10mb_overhead if contract else None,
+                    contract.weight_streaming_required if contract else None,
+                )
 
     def get_max_batch_size(
         self,
@@ -287,34 +465,24 @@ class MemoryPlanner:
             schedulers. Those schedulers admit work using token budget and
             block-level checks at runtime.
         """
-        requested_memory = self._get_requested_memory_bytes(gpu_memory_utilization)
-        parameter_memory_per_device = self._get_parameter_memory_per_device()
-        overhead_bytes = self._validate_non_kv_cache_overhead_bytes(
-            non_kv_cache_overhead_bytes
+        budget = self.get_memory_budget(
+            gpu_memory_utilization=gpu_memory_utilization,
+            non_kv_cache_overhead_bytes=non_kv_cache_overhead_bytes,
         )
+        requested_memory = budget.requested_memory_bytes
+        parameter_memory_per_device = budget.resident_plus_buffer_bytes
+        overhead_bytes = budget.total_overhead_bytes
         kv_cache_memory_per_device_per_request = (
             self._get_kv_cache_memory_per_device_per_request()
         )
 
-        memory_for_kv_cache = (
-            requested_memory - parameter_memory_per_device - overhead_bytes
-        )
+        memory_for_kv_cache = budget.available_memory_bytes
 
         # For clusters that do not use KV cache (e.g., DECODE_FFN),
         # the batch size is bounded by an activation-memory proxy.
         if kv_cache_memory_per_device_per_request == 0:
             if self._cluster_type == ClusterType.DECODE_FFN:
-                if memory_for_kv_cache <= 0:
-                    self._raise_memory_oom(
-                        reason="insufficient_activation_budget",
-                        message="No memory remains for decode-FFN activations after reserving weights, staging and overhead.",
-                        details={
-                            "requested_memory_bytes": requested_memory,
-                            "parameter_memory_per_device_bytes": parameter_memory_per_device,
-                            "non_kv_cache_overhead_bytes": overhead_bytes,
-                            "available_activation_bytes": memory_for_kv_cache,
-                        },
-                    )
+                self.validate_decode_ffn_sram_budget(budget)
                 estimated_memory_per_request = max(
                     parameter_memory_per_device // 100,
                     1024 * 1024,
@@ -336,11 +504,14 @@ class MemoryPlanner:
                 reason="insufficient_request_budget",
                 message="Not enough memory to store even a single worst-case request.",
                 details={
+                    "nominal_memory_bytes": budget.nominal_memory_bytes,
+                    "usable_memory_bytes": budget.usable_memory_bytes,
                     "requested_memory_bytes": requested_memory,
                     "parameter_memory_per_device_bytes": parameter_memory_per_device,
                     "memory_for_kv_cache_bytes": memory_for_kv_cache,
                     "kv_cache_per_request_bytes": kv_cache_memory_per_device_per_request,
-                    "non_kv_cache_overhead_bytes": overhead_bytes,
+                    "planning_overhead_bytes": budget.planning_overhead_bytes,
+                    "non_kv_cache_overhead_bytes": budget.non_kv_cache_overhead_bytes,
                 },
             )
 

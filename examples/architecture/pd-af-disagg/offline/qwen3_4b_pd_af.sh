@@ -35,7 +35,9 @@ NUM_REQUESTS="${NUM_REQUESTS:-8}"
 PREFILL_TOKENS="${PREFILL_TOKENS:-512}"
 DECODE_TOKENS="${DECODE_TOKENS:-64}"
 ARRIVAL_PATTERN="${ARRIVAL_PATTERN:-burst}"
-WEIGHT_STREAM_LAYERS="${WEIGHT_STREAM_LAYERS:-0}"
+WEIGHT_STREAM_LAYERS="${WEIGHT_STREAM_LAYERS:-2}"
+HPP2_USABLE_MEMORY_MB="${HPP2_USABLE_MEMORY_MB:-170}"
+HPP2_PLANNING_OVERHEAD_MB="${HPP2_PLANNING_OVERHEAD_MB:-10}"
 AF_MICRO_BATCH="${AF_MICRO_BATCH:-1}"
 DECODE_ATTN_MICRO_BATCH_SIZE="${DECODE_ATTN_MICRO_BATCH_SIZE:-8}"
 
@@ -87,6 +89,45 @@ case "$WEIGHT_STREAM_LAYERS" in
     exit 2
     ;;
 esac
+
+CLI_OVERRIDES_FFN_BUDGET=0
+for arg in "$@"; do
+  case "$arg" in
+    --cluster_config_decode_ffn_replica_config_streamed_ffn_layers|--cluster_config_decode_ffn_replica_config_streamed_ffn_layers=*)
+      echo "ERROR: Do not pass $arg via trailing script arguments; set WEIGHT_STREAM_LAYERS=<0|1|2|3> so the matching stream CPU-overhead table and SRAM guard stay in sync." >&2
+      exit 2
+      ;;
+    --cluster_config_decode_ffn_replica_config_usable_memory_mb|--cluster_config_decode_ffn_replica_config_usable_memory_mb=*|\
+    --cluster_config_decode_ffn_replica_config_planning_overhead_mb|--cluster_config_decode_ffn_replica_config_planning_overhead_mb=*|\
+    --cluster_config_decode_ffn_replica_config_moe_tensor_parallel_size|--cluster_config_decode_ffn_replica_config_moe_tensor_parallel_size=*)
+      CLI_OVERRIDES_FFN_BUDGET=1
+      ;;
+  esac
+done
+
+# Validate HPP2 SRAM budget env inputs before applying the TP16 guard.
+if ! awk -v u="$HPP2_USABLE_MEMORY_MB" -v o="$HPP2_PLANNING_OVERHEAD_MB" \
+  'BEGIN { num = "^[0-9]+(\\.[0-9]+)?$"; exit !(u ~ num && o ~ num && u > 0 && u <= 192 && o >= 0 && o < u) }'; then
+  echo "ERROR: Invalid HPP2 SRAM budget (HPP2_USABLE_MEMORY_MB=${HPP2_USABLE_MEMORY_MB}, HPP2_PLANNING_OVERHEAD_MB=${HPP2_PLANNING_OVERHEAD_MB}); require numeric 0 < usable <= 192 MiB and 0 <= overhead < usable MiB." >&2
+  exit 2
+fi
+
+# Strict binary MiB HPP2 SRAM guard: 170 MiB usable - 10 MiB overhead = 160 MiB.
+# At TP16, stream 0/1 needs 36 * 4,669,440 B = 160.3125 MiB on-chip; fail fast
+# unless the numeric net budget (usable - overhead) is explicitly relaxed above 160.3125 MiB
+# or trailing CLI flags override decode-FFN budget/TP for MemoryPlanner to validate.
+if [ "$WEIGHT_STREAM_LAYERS" = "0" ] || [ "$WEIGHT_STREAM_LAYERS" = "1" ]; then
+  if [ "$CLI_OVERRIDES_FFN_BUDGET" = "1" ]; then
+    echo "WARNING: Deferring WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS HPP2 SRAM check to MemoryPlanner due to trailing CLI decode-FFN budget/TP override." >&2
+  elif awk -v u="$HPP2_USABLE_MEMORY_MB" -v o="$HPP2_PLANNING_OVERHEAD_MB" \
+    'BEGIN { exit !((u - o) > 160.3125) }'; then
+    echo "WARNING: Running WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS with relaxed HPP2 SRAM budget (usable=${HPP2_USABLE_MEMORY_MB} MiB, overhead=${HPP2_PLANNING_OVERHEAD_MB} MiB; default 170/10 MiB is infeasible)." >&2
+  else
+    echo "ERROR: WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS requires 160.31 MiB + ${HPP2_PLANNING_OVERHEAD_MB} MiB > ${HPP2_USABLE_MEMORY_MB} MiB usable SRAM (default 170.00 MiB usable / 10.00 MiB overhead, nominal 192 MiB)." >&2
+    echo "       Use WEIGHT_STREAM_LAYERS=2 (155.86 + 10.00 = 165.86 MiB) or 3 (151.41 + 10.00 = 161.41 MiB), or override HPP2_USABLE_MEMORY_MB / HPP2_PLANNING_OVERHEAD_MB for diagnostics." >&2
+    exit 2
+  fi
+fi
 
 case "$ARRIVAL_PATTERN" in
   burst)
@@ -154,6 +195,8 @@ CMD=(
   --cluster_config_decode_ffn_replica_config_router_topk 1
   --cluster_config_decode_ffn_replica_config_device hpp2
   --cluster_config_decode_ffn_replica_config_streamed_ffn_layers "$WEIGHT_STREAM_LAYERS"
+  --cluster_config_decode_ffn_replica_config_usable_memory_mb "$HPP2_USABLE_MEMORY_MB"
+  --cluster_config_decode_ffn_replica_config_planning_overhead_mb "$HPP2_PLANNING_OVERHEAD_MB"
   --cluster_config_decode_ffn_replica_config_network_device hpp2_16rank
   --cluster_config_decode_ffn_replica_config_memory_margin_fraction 0.0
 
@@ -228,9 +271,9 @@ echo " Qwen3-4B PD-AF"
 echo " model: Qwen3-4B"
 echo " PREFILL:    h200 x8, attn TP8"
 echo " DECODE_ATTN:h200 x8, attn TP8"
-echo " DECODE_FFN: hpp2 x8/16 ranks, FFN TP16"
+echo " DECODE_FFN: hpp2 x8/16 ranks, FFN TP16 (usable=${HPP2_USABLE_MEMORY_MB} MiB, overhead=${HPP2_PLANNING_OVERHEAD_MB} MiB, nominal=192 MiB)"
 echo " requests:   $NUM_REQUESTS, prefill=$PREFILL_TOKENS, decode=$DECODE_TOKENS; $ARRIVAL_DESCRIPTION"
-echo " weight stream: $WEIGHT_STREAM_LAYERS layer(s) (0 = all resident)"
+echo " weight stream: $WEIGHT_STREAM_LAYERS layer(s)"
 echo " metrics:    $OUT_DIR/$RUN_ID"
 echo "========================================================="
 exec "${CMD[@]}"
