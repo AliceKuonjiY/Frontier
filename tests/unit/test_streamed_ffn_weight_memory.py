@@ -177,8 +177,56 @@ def test_simulation_config_cli_parses_decode_ffn_sram_budget_flags():
         assert ffn.usable_memory_mb == 170.0
         assert ffn.planning_overhead_mb == 10.0
         assert not ffn.has_relaxed_memory_budget_override()
+
+        bad_margin_cli = [
+            *cli_args[:-10],
+            "--cluster_config_decode_ffn_replica_config_memory_margin_fraction", "-0.1",
+            *cli_args[-8:],
+        ]
+        with patch.object(sys, "argv", bad_margin_cli):
+            with pytest.raises(ValueError, match="memory_margin_fraction"):
+                SimulationConfig.create_from_cli_args()
     finally:
         global_vars.reset_global_vars()
+
+
+def test_memory_margin_validation_and_get_num_blocks_oom_details():
+    for invalid_margin in (-0.1, 1.0, 1.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="memory_margin_fraction"):
+            ffn_replica(2, memory_margin_fraction=invalid_margin)
+        bad_rank = SimpleNamespace(total_memory_gb=0.1875, memory_margin_fraction=invalid_margin)
+        planner = MemoryPlanner(ffn_replica(2, memory_margin_fraction=0.0), bad_rank, ClusterType.DECODE_FFN)
+        with pytest.raises(ValueError, match="memory_margin_fraction"):
+            planner.get_memory_budget()
+
+    # get_num_blocks() final OOM branch separates planning_overhead_bytes from non_kv_cache_overhead_bytes.
+    cfg = ReplicaConfig(
+        model_name="Qwen3-4B",
+        device="h200",
+        network_device="h200_dgx",
+        attn_tensor_parallel_size=8,
+        moe_tensor_parallel_size=8,
+        memory_margin_fraction=0.0,
+        usable_memory_mb=4096.0,
+        planning_overhead_mb=16.0,
+    )
+    gen_cfg = SyntheticRequestGeneratorConfig(num_requests=1)
+    replica = Replica(cfg, gen_cfg, ClusterType.PREFILL)
+    planner = MemoryPlanner(cfg, replica, ClusterType.PREFILL)
+    non_kv_extra = (
+        4096 * BINARY_MIB_BYTES
+        - 16 * BINARY_MIB_BYTES
+        - planner.get_parameter_memory_per_device_bytes()
+        - 1024
+    )
+    assert non_kv_extra > 0
+    with pytest.raises(FrontierMemoryOOMError, match="allocate even one block") as oom:
+        planner.get_num_blocks(block_size=16, non_kv_cache_overhead_bytes=non_kv_extra)
+    assert oom.value.reason == "insufficient_kv_cache_budget"
+    assert oom.value.details["nominal_memory_bytes"] == cfg.get_nominal_memory_bytes()
+    assert oom.value.details["usable_memory_bytes"] == 4096 * BINARY_MIB_BYTES
+    assert oom.value.details["planning_overhead_bytes"] == 16 * BINARY_MIB_BYTES
+    assert oom.value.details["non_kv_cache_overhead_bytes"] == non_kv_extra
 
 
 @pytest.mark.parametrize("tp,streamed_layers,activation_bytes,should_fit", [
@@ -212,8 +260,36 @@ def test_profiling_csv_sram_contract_and_diagnostic_override(tmp_path):
     assert tp16.profiling_precision == "FP8"
     assert tp16.sram_fit_with_10mb_overhead is False
     assert tp16.weight_streaming_required is True
-    assert load_sram_profile_contract(str(HPP2_LINEAR_CSV), 16, profiling_precision="FP4") is None
+    # Cross-precision fallback preserves FP8 contract so wider weights (BF16) are still
+    # blocked while narrower weights (FP4) are not falsely rejected.
+    fallback_fp4 = load_sram_profile_contract(str(HPP2_LINEAR_CSV), 16, profiling_precision="FP4")
+    assert fallback_fp4 is not None and fallback_fp4.profiling_precision == "FP8"
+    assert not fallback_fp4.rejects_all_resident_for_weight_bytes(0.5)
+    assert fallback_fp4.rejects_all_resident_for_weight_bytes(2.0)
     assert load_sram_profile_contract(str(H200_LINEAR_CSV), 8) is None
+
+    # Mixed-precision CSV (file-level BF16, op-level mlp_up_proj=FP8) resolves MLP precision.
+    mixed_op_csv = tmp_path / "mixed_op.csv"
+    mixed_op_csv.write_text(
+        'num_tensor_parallel_workers,profiling_precision,profiling_precision_by_op,sram_fit_with_10mb_overhead\n'
+        '16,BF16,"{""mlp_up_proj"":""FP8"",""mlp_down_proj"":""FP8""}",False\n',
+        encoding="utf-8",
+    )
+    mixed_slice = load_sram_profile_contract(str(mixed_op_csv), 16, profiling_precision="FP8")
+    assert mixed_slice is not None and mixed_slice.profiling_precision == "FP8"
+    assert mixed_slice.rejects_all_resident_for_weight_bytes(1.0)
+    assert not mixed_slice.rejects_all_resident_for_weight_bytes(0.5)
+
+    # Empty quantized_operations=[] must fall back to default precision instead of assuming FP8.
+    from frontier.scheduler.utils.sram_budget import _effective_mlp_precision_label
+
+    unquant_cfg = ffn_replica(0, moe_tensor_parallel_size=16, memory_margin_fraction=0.0)
+    orig_ops = unquant_cfg.model_config.quantization_config.quantized_operations
+    unquant_cfg.model_config.quantization_config.quantized_operations = []
+    try:
+        assert _effective_mlp_precision_label(unquant_cfg.model_config) == "BF16"
+    finally:
+        unquant_cfg.model_config.quantization_config.quantized_operations = orig_ops
 
     # Multi-precision CSV resolves cleanly per precision without false conflict.
     multi_prec_csv = tmp_path / "multi_prec.csv"

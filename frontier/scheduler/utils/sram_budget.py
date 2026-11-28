@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+import json
 import math
 import os
 from typing import Any, Optional
@@ -104,15 +105,17 @@ def _effective_mlp_precision_label(model_cfg: Any) -> Optional[str]:
     quant = getattr(model_cfg, "quantization_config", None)
     quant_method = getattr(quant, "quant_method", None) if quant is not None else None
     if quant_method:
-        quantized_ops = set(
-            getattr(quant, "quantized_operations", None)
-            or {
+        raw_quantized_ops = getattr(quant, "quantized_operations", None)
+        quantized_ops = (
+            {
                 "attn_pre_proj",
                 "attn_post_proj",
                 "mlp_up_proj",
                 "mlp_down_proj",
                 "moe_grouped_gemm",
             }
+            if raw_quantized_ops is None
+            else set(raw_quantized_ops)
         )
         if "mlp_up_proj" in quantized_ops:
             return str(quant_method).strip().upper()
@@ -124,6 +127,25 @@ def _effective_mlp_precision_label(model_cfg: Any) -> Optional[str]:
     if default_prec is not None:
         return str(getattr(default_prec, "name", default_prec)).strip().upper()
     return None
+
+
+def _row_mlp_precision(
+    row: dict[str, Any], has_op_precision_col: bool, has_precision_col: bool
+) -> str:
+    if has_op_precision_col:
+        raw_by_op = (row.get("profiling_precision_by_op") or "").strip()
+        if raw_by_op:
+            try:
+                parsed = json.loads(raw_by_op)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                op_prec = parsed.get("mlp_up_proj") or parsed.get("mlp_down_proj")
+                if isinstance(op_prec, str) and op_prec.strip():
+                    return op_prec.strip().upper()
+    if has_precision_col:
+        return (row.get("profiling_precision") or "").strip().upper()
+    return ""
 
 
 def load_sram_profile_contract(
@@ -148,32 +170,38 @@ def load_sram_profile_contract(
             return None
 
         has_precision_col = "profiling_precision" in fields
-        observed: dict[str, set[Any]] = {col: set() for col in SRAM_PROFILE_COLUMNS}
-        observed_precisions: set[str] = set()
-        matched = 0
+        has_op_precision_col = "profiling_precision_by_op" in fields
+        tp_rows: list[tuple[str, dict[str, Any]]] = []
         for row in reader:
             raw_tp = (row.get("num_tensor_parallel_workers") or "").strip()
             if not raw_tp or int(float(raw_tp)) != target_tp:
                 continue
-            row_precision = (
-                (row.get("profiling_precision") or "").strip().upper()
-                if has_precision_col
-                else ""
+            tp_rows.append(
+                (_row_mlp_precision(row, has_op_precision_col, has_precision_col), row)
             )
-            if target_precision and row_precision and row_precision != target_precision:
-                continue
-            matched += 1
-            if row_precision:
-                observed_precisions.add(row_precision)
-            for col in _FLOAT_COLS:
-                if col in fields:
-                    observed[col].add(_parse_float(row.get(col), col, file_path))
-            for col in _BOOL_COLS:
-                if col in fields:
-                    observed[col].add(_parse_bool(row.get(col), col, file_path))
 
-    if matched == 0:
+    if not tp_rows:
         return None
+
+    if target_precision:
+        exact_rows = [
+            item for item in tp_rows if not item[0] or item[0] == target_precision
+        ]
+        selected_rows = exact_rows if exact_rows else tp_rows
+    else:
+        selected_rows = tp_rows
+
+    observed: dict[str, set[Any]] = {col: set() for col in SRAM_PROFILE_COLUMNS}
+    observed_precisions: set[str] = set()
+    for row_precision, row in selected_rows:
+        if row_precision:
+            observed_precisions.add(row_precision)
+        for col in _FLOAT_COLS:
+            if col in fields:
+                observed[col].add(_parse_float(row.get(col), col, file_path))
+        for col in _BOOL_COLS:
+            if col in fields:
+                observed[col].add(_parse_bool(row.get(col), col, file_path))
 
     resolved: dict[str, Any] = {}
     for col in SRAM_PROFILE_COLUMNS:

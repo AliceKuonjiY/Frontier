@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Optional
 
 from frontier.config.device_sku_config import (
@@ -150,6 +151,17 @@ class ReplicaConfig:
         self.node_config: BaseNodeSKUConfig = BaseNodeSKUConfig.create_from_type_string(
             self.network_device
         )
+
+        if (
+            isinstance(self.memory_margin_fraction, bool)
+            or not math.isfinite(float(self.memory_margin_fraction))
+            or not (0.0 <= float(self.memory_margin_fraction) < 1.0)
+        ):
+            raise ValueError(
+                "memory_margin_fraction must be a finite value in [0, 1), "
+                f"got {self.memory_margin_fraction!r}"
+            )
+        self.memory_margin_fraction = float(self.memory_margin_fraction)
 
         if self.usable_memory_mb is not None:
             self.usable_memory_mb = validate_memory_mb_value(

@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 from frontier.attention.memory import get_attention_runtime_kv_layout
@@ -44,18 +45,34 @@ class MemoryPlanner:
         self, gpu_memory_utilization: Optional[float]
     ) -> float:
         if gpu_memory_utilization is not None:
-            if gpu_memory_utilization <= 0 or gpu_memory_utilization > 1.0:
+            if (
+                isinstance(gpu_memory_utilization, bool)
+                or not math.isfinite(float(gpu_memory_utilization))
+                or float(gpu_memory_utilization) <= 0
+                or float(gpu_memory_utilization) > 1.0
+            ):
                 raise ValueError(
                     "gpu_memory_utilization must be in (0, 1], "
                     f"got={gpu_memory_utilization!r}"
                 )
-            return gpu_memory_utilization
+            return float(gpu_memory_utilization)
 
         if self._replica is not None:
-            margin = float(self._replica.memory_margin_fraction)
+            raw_margin = self._replica.memory_margin_fraction
         else:
-            margin = float(getattr(self._replica_config, "memory_margin_fraction", 0.0))
-        return 1 - margin
+            raw_margin = getattr(self._replica_config, "memory_margin_fraction", 0.0)
+        if isinstance(raw_margin, bool) or not math.isfinite(float(raw_margin)):
+            raise ValueError(
+                "memory_margin_fraction must be a finite value in [0, 1), "
+                f"got={raw_margin!r}"
+            )
+        margin = float(raw_margin)
+        if margin < 0.0 or margin >= 1.0:
+            raise ValueError(
+                "memory_margin_fraction must be a finite value in [0, 1), "
+                f"got={raw_margin!r}"
+            )
+        return 1.0 - margin
 
     def get_nominal_memory_bytes(self) -> int:
         if self._replica is not None and getattr(self._replica, "total_memory_gb", None) is not None:
@@ -336,10 +353,13 @@ class MemoryPlanner:
                 reason="insufficient_kv_cache_budget",
                 message="Not enough KV cache budget to allocate even one block.",
                 details={
+                    "nominal_memory_bytes": budget.nominal_memory_bytes,
+                    "usable_memory_bytes": budget.usable_memory_bytes,
                     "requested_memory_bytes": requested_memory,
                     "parameter_memory_per_device_bytes": parameter_memory_per_device,
+                    "planning_overhead_bytes": budget.planning_overhead_bytes,
+                    "non_kv_cache_overhead_bytes": budget.non_kv_cache_overhead_bytes,
                     "available_kv_cache_memory_bytes": available_kv_cache_memory,
-                    "non_kv_cache_overhead_bytes": overhead_bytes,
                     "page_size_bytes": int(page_size),
                     "num_full_attention_layers": num_full_attention_layers,
                     "num_gdn_layers": self._get_num_gdn_layers_per_device(),
