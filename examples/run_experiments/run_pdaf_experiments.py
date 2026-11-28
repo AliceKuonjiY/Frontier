@@ -55,6 +55,7 @@ import json
 import math
 import os
 import platform
+import shlex
 import shutil
 import signal
 import subprocess
@@ -62,6 +63,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version as package_version
 
@@ -86,6 +88,7 @@ RUNS_ROOT = REPO_ROOT / "outputs" / "runs"
 DEFAULT_WORKERS = 3
 DEFAULT_TRAINING_THREADS = 1
 DEFAULT_TIMEOUT_S = 3600
+NO_GIT_SESSION_ID = uuid.uuid4().hex
 
 # main() 会根据 --output-dir 重新绑定这些全局变量；模块级默认值只为
 # --dry-run / --list 时 build_command() 能正常构造命令。
@@ -1120,7 +1123,12 @@ def write_publish_marker(row: dict[str, Any]) -> None:
 
 
 def published_matches(row: dict[str, Any]) -> bool:
-    dst = Path(row.get("published_dir", ""))
+    if not row:
+        return False
+    raw_dst = row.get("published_dir")
+    if not isinstance(raw_dst, str) or not raw_dst.strip():
+        return False
+    dst = Path(raw_dst)
     meta_path = dst / "publish_metadata.json"
     if not meta_path.is_file():
         return False
@@ -1135,11 +1143,22 @@ def published_matches(row: dict[str, Any]) -> bool:
 
 
 def ensure_published(row: dict[str, Any]) -> bool:
+    if not row:
+        return False
     if published_matches(row):
         return True
-    src = Path(row.get("metrics_dir", ""))
-    dst = Path(row.get("published_dir", ""))
-    if not row or not src.is_dir() or not str(dst):
+    raw_src = row.get("metrics_dir")
+    raw_dst = row.get("published_dir")
+    if (
+        not isinstance(raw_src, str)
+        or not raw_src.strip()
+        or not isinstance(raw_dst, str)
+        or not raw_dst.strip()
+    ):
+        return False
+    src = Path(raw_src)
+    dst = Path(raw_dst)
+    if not src.is_dir():
         return False
     try:
         publish_metrics(src, dst)
@@ -1234,7 +1253,7 @@ def run_one(
     env.setdefault("OPENBLAS_NUM_THREADS", "2")
 
     cmd = build_command(exp, attempt_root, training_threads, cache_dir)
-    (attempt_root / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
+    (attempt_root / "command.txt").write_text(shlex.join(cmd) + "\n", encoding="utf-8")
     t0 = time.time()
     popen_kwargs: dict[str, Any] = {}
     if os.name == "posix":
@@ -1327,15 +1346,18 @@ def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
         full = (REPO_ROOT / rel).resolve()
         return any(full == root or root in full.parents for root in excluded)
 
-    def _run(*args: str) -> str:
+    def _run(*args: str, text: bool = True):
         try:
-            return subprocess.check_output(
+            kwargs = {"stderr": subprocess.DEVNULL}
+            if text:
+                kwargs.update(text=True, errors="replace")
+            output = subprocess.check_output(
                 ["git", "-C", str(REPO_ROOT), *args],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
+                **kwargs,
+            )
+            return output.strip() if text else output
         except (OSError, subprocess.CalledProcessError):
-            return ""
+            return "" if text else b""
 
     pathspec: list[str] = []
     for root in excluded:
@@ -1348,7 +1370,7 @@ def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
         pathspec.append(f":(exclude,top){rel.as_posix()}")
     source_scope = ["--", ".", *pathspec] if pathspec else []
     status = _run("status", "--porcelain", *source_scope)
-    diff = _run("diff", "--binary", "HEAD", *source_scope)
+    diff = _run("diff", "--binary", "HEAD", *source_scope, text=False)
     untracked_digest = hashlib.sha256()
     for rel in sorted(filter(None, _run("ls-files", "--others", "--exclude-standard", "-z").split("\0"))):
         if _is_excluded(rel):
@@ -1367,13 +1389,18 @@ def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
         "last_commit": _run("log", "-1", "--oneline"),
         "dirty": bool(status),
         "status_porcelain": status,
-        "diff_hash": _sha256_text(diff)[:16],
+        "diff_hash": _sha256_bytes(diff)[:16],
         "untracked_hash": untracked_digest.hexdigest()[:16],
+        "available": bool(_run("rev-parse", "HEAD")),
     }
 
 
 def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def _package_version(name: str) -> str:
@@ -1415,9 +1442,12 @@ def current_source(
     """Identity of the working tree that produced a result row."""
     git = git or git_info(exclude_paths=exclude_paths)
     status = git.get("status_porcelain", "")
+    git_available = bool(git.get("head"))
     source = {
-        "source_commit": git.get("head") or "nogit",
+        "source_commit": git.get("head") or f"nogit-{NO_GIT_SESSION_ID}",
         "source_short_commit": git.get("short_head") or "nogit",
+        "source_git_available": git_available,
+        "source_nogit_session": "" if git_available else NO_GIT_SESSION_ID,
         "source_branch": git.get("branch") or "",
         "source_dirty": bool(git.get("dirty")),
         "source_status_hash": _sha256_text(status)[:16],
@@ -1456,6 +1486,25 @@ def source_fingerprint(source: dict[str, Any]) -> str:
         separators=(",", ":"),
     )
     return _sha256_text(payload)
+
+
+def pending_marker_active(path: Path, current_fingerprint: str | None) -> bool:
+    """Whether a pending marker belongs to the current source snapshot.
+
+    Corrupt or old-format markers are treated as active conservatively.  A
+    valid marker from another source snapshot is stale and must not block a
+    restored historical result.
+    """
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    recorded = data.get("run_fingerprint") if isinstance(data, dict) else None
+    if not isinstance(recorded, str) or not recorded:
+        return True
+    return current_fingerprint is not None and recorded == current_fingerprint
 
 
 def load_existing_rows(results_csv: Path) -> list[dict[str, Any]]:
@@ -1699,17 +1748,22 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
 
     poisson = [r for r in rows if r.get("stage") == "gpu_scale_poisson"]
     if poisson:
-        out.append("## Poisson 在线（64 请求）")
+        out.append("## Poisson 在线")
         out.append("")
         poi_sorted = sorted(
             poisson,
-            key=lambda x: (x["name"].split("_qps")[0], _to_float(x.get("qps"), 0.0)),
+            key=lambda x: (
+                _to_int(x.get("num_req"), 0),
+                x["name"].split("_qps")[0],
+                _to_float(x.get("qps"), 0.0),
+            ),
         )
         out.append(_table(
-            ["配置", "QPS", "TTFT", "TPOT", "E2E", "输出 tok/s", "完成请求"],
+            ["配置", "请求数", "QPS", "TTFT", "TPOT", "E2E", "输出 tok/s", "完成请求"],
             [
                 [
                     r["name"],
+                    r.get("num_req", "—"),
                     _fmt(_to_float(r.get("qps")), 0),
                     _fmt(_to_float(r.get("ttft_mean_ms"))),
                     _fmt(_to_float(r.get("tpot_mean_ms")), 3),
@@ -1984,6 +2038,12 @@ def preflight(selection_label: str, stages: set[str], selected: list[Experiment]
         errors.append(f"Frontier 不是 git 仓库：{REPO_ROOT}")
     if not (REPO_ROOT / "frontier" / "main.py").exists():
         errors.append(f"找不到 frontier/main.py：{REPO_ROOT}")
+    git_probe = git_info()
+    if not git_probe.get("head"):
+        errors.append(
+            "无法读取 git HEAD；请确认这是完整仓库且 git 可用 "
+            "（无 git 环境不能安全复用实验缓存）"
+        )
     for rel in REQUIRED_DATA:
         if not (REPO_ROOT / rel).exists():
             errors.append(f"缺少 profiling 文件：{rel}")
@@ -2182,7 +2242,15 @@ def main() -> int:
         for c in selected:
             print(f"  {c.name}")
         print("\n第一条命令：")
-        print(" ".join(build_command(selected[0], cache_dir=preview_cache)))
+        print(
+            shlex.join(
+                build_command(
+                    selected[0],
+                    training_threads=args.training_threads,
+                    cache_dir=preview_cache,
+                )
+            )
+        )
         return 0
 
     output_dir = resolve_output_dir(args.output_dir, create=True)
@@ -2195,11 +2263,24 @@ def main() -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    old_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _handle_sigterm(signum, frame) -> None:
+        raise KeyboardInterrupt
+
+    # SIGTERM must use the same cancellation path as Ctrl-C; children run in
+    # separate sessions, so default termination would leave them alive.
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         lock = OutputDirLock(output_dir).acquire()
     except KeyboardInterrupt:
-        print("\n等待目录锁时收到 Ctrl-C，退出。", file=sys.stderr)
+        signal.signal(signal.SIGTERM, old_sigterm)
+        print("\n等待目录锁时收到终止信号，退出。", file=sys.stderr)
         return 130
+    except BaseException:
+        signal.signal(signal.SIGTERM, old_sigterm)
+        raise
     try:
         run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
         run_manifest_path = output_dir / "manifests" / f"{run_id}.json"
@@ -2240,7 +2321,19 @@ def main() -> int:
 
         # The fixed published path may belong to another source snapshot after
         # switching A -> B -> A.  Restore it from the matching immutable attempt.
-        pending_now = {p.stem for p in pending_dir.glob("*.json")}
+        cfg_by_name = {c.name: c for c in all_cfgs}
+        pending_now: set[str] = set()
+        for marker in pending_dir.glob("*.json"):
+            if pending_marker_active(marker, all_run_fps.get(marker.stem)):
+                pending_now.add(marker.stem)
+            else:
+                marker.unlink(missing_ok=True)
+        # A pending case must not expose a fixed published copy, even when the
+        # current selection does not include it.
+        for name in pending_now:
+            exp = cfg_by_name.get(name)
+            if exp is not None:
+                withdraw_published(exp, output_dir)
         for name in list(current_by_name):
             if name in pending_now:
                 continue
@@ -2249,7 +2342,6 @@ def main() -> int:
 
         # Withdraw published copies whose source does not match the current
         # snapshot; they remain recoverable from attempts/ if the source returns.
-        cfg_by_name = {c.name: c for c in all_cfgs}
         for name in rows_by_name:
             if name in current_by_name or name in pending_now:
                 continue
@@ -2258,10 +2350,13 @@ def main() -> int:
                 withdraw_published(exp, output_dir)
 
         def cache_state(exp: Experiment) -> str:
-            if pending_path(exp).exists():
+            if pending_marker_active(pending_path(exp), run_fps[exp.name]):
                 return "pending"
-            if exp.name in current_by_name:
-                return "current"
+            row = current_by_name.get(exp.name)
+            if row is not None:
+                if ensure_published(row):
+                    return "current"
+                del current_by_name[exp.name]
             return "stale" if exp.name in rows_by_name else "missing"
 
         stale = [c for c in selected if cache_state(c) == "stale"]
@@ -2322,7 +2417,7 @@ def main() -> int:
         manifest_path.write_text(manifest_text, encoding="utf-8")
         run_manifest_path.write_text(manifest_text, encoding="utf-8")
         commands_text = "\n\n".join(
-            " ".join(
+            shlex.join(
                 build_command(
                     c,
                     training_threads=args.training_threads,
@@ -2352,7 +2447,11 @@ def main() -> int:
             return ordered
 
         def current_rows_now() -> list[dict[str, Any]]:
-            pending = {p.stem for p in pending_dir.glob("*.json")}
+            pending = {
+                p.stem
+                for p in pending_dir.glob("*.json")
+                if pending_marker_active(p, all_run_fps.get(p.stem))
+            }
             return [
                 r for r in current_by_name.values()
                 if r["name"] not in pending
@@ -2363,7 +2462,11 @@ def main() -> int:
         print(f"配置数   : {len(selected)}（缓存 {len(selected) - len(to_run)}，待跑 {len(to_run)}）")
         if stale and not args.force:
             print(f"旧结果   : {len(stale)} 个源码/配置指纹不匹配，将重跑")
-        pending_before = [c for c in selected if pending_path(c).exists()]
+        pending_before = [
+            c
+            for c in selected
+            if pending_marker_active(pending_path(c), run_fps[c.name])
+        ]
         if pending_before:
             print(f"待重跑   : {len(pending_before)} 个上次中断/失败未完成")
         print(f"workers  : {args.workers}")
@@ -2454,7 +2557,7 @@ def main() -> int:
         except KeyboardInterrupt:
             interrupted = True
             print(
-                "\n收到 Ctrl-C：取消排队任务、终止在跑仿真，并保存已完成结果。",
+                "\n收到 Ctrl-C / SIGTERM：取消排队任务、终止在跑仿真，并保存已完成结果。",
                 file=sys.stderr,
             )
             CANCEL_EVENT.set()
@@ -2467,12 +2570,16 @@ def main() -> int:
         # A pending case must never leave a published fixed path behind, including
         # results that finished in a worker while the main loop was interrupted.
         for exp in selected:
-            if pending_path(exp).exists():
+            if pending_marker_active(pending_path(exp), run_fps[exp.name]):
                 withdraw_published(exp, output_dir)
 
         ordered = ordered_rows()
         save_csv(history_rows, RESULTS_CSV)
-        pending_names = sorted(p.stem for p in pending_dir.glob("*.json"))
+        pending_names = sorted(
+            p.stem
+            for p in pending_dir.glob("*.json")
+            if pending_marker_active(p, all_run_fps.get(p.stem))
+        )
         pending_set = set(pending_names)
         current_rows = current_rows_now()
         save_csv(current_rows, current_csv)
@@ -2521,6 +2628,7 @@ def main() -> int:
 
     finally:
         lock.release()
+        signal.signal(signal.SIGTERM, old_sigterm)
 
 if __name__ == "__main__":
     raise SystemExit(main())

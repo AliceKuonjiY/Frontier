@@ -168,6 +168,18 @@ def test_runtime_dependency_preflight_includes_plotly() -> None:
     assert "ddsketch" in runner.RUNTIME_MODULES
 
 
+def test_git_info_marks_missing_repository_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
+    info = runner.git_info()
+    assert info["available"] is False
+    source = runner.current_source(info)
+    assert source["source_git_available"] is False
+    assert source["source_commit"].startswith("nogit-")
+    assert source["source_nogit_session"]
+
+
 def test_summary_handles_na_and_empty_numeric_fields(tmp_path: Path) -> None:
     rows = [
         {
@@ -290,6 +302,32 @@ def test_run_one_terminates_if_cancel_arrives_during_spawn(
 
     assert (name, row, err) == ("g16_p8_d8_tp2", None, "cancelled")
     assert len(terminated) == 1
+
+
+def test_pending_marker_requires_matching_fingerprint(tmp_path: Path) -> None:
+    marker = tmp_path / "case.json"
+    marker.write_text(json.dumps({"run_fingerprint": "fp-a"}))
+    assert runner.pending_marker_active(marker, "fp-a")
+    assert not runner.pending_marker_active(marker, "fp-b")
+    marker.write_text("{broken")
+    assert runner.pending_marker_active(marker, "fp-b")
+    marker.write_text(json.dumps({"run_id": "old"}))
+    assert runner.pending_marker_active(marker, "fp-b")
+    marker.unlink()
+    assert not runner.pending_marker_active(marker, "fp-a")
+
+
+def test_ensure_published_rejects_empty_paths(tmp_path: Path) -> None:
+    published = tmp_path / "published"
+    assert not runner.published_matches({})
+    assert not runner.ensure_published({})
+    assert not runner.ensure_published(
+        {"metrics_dir": "", "published_dir": str(published)}
+    )
+    assert not runner.ensure_published(
+        {"metrics_dir": None, "published_dir": str(published)}
+    )
+    assert not published.exists()
 
 
 def test_ensure_published_restores_matching_attempt(tmp_path: Path) -> None:
