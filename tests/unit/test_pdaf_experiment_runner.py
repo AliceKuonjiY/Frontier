@@ -201,10 +201,11 @@ def test_run_one_terminates_if_cancel_arrives_during_spawn(
 
     monkeypatch.setattr(runner.subprocess, "Popen", FakePopen)
     monkeypatch.setattr(runner, "_terminate_proc", lambda proc: terminated.append(proc))
+    monkeypatch.setattr(runner, "current_source", lambda exclude_paths=(): _source())
 
     try:
         name, row, err, _ = runner.run_one(
-            _experiment(), 1, _source(), "fingerprint"
+            _experiment(), 1, _source(), "fingerprint", tmp_path / "out"
         )
     finally:
         runner.CANCEL_EVENT.clear()
@@ -214,11 +215,55 @@ def test_run_one_terminates_if_cancel_arrives_during_spawn(
     assert len(terminated) == 1
 
 
-def test_run_one_honours_cancellation_before_spawn() -> None:
+def test_withdraw_published_moves_fixed_metrics_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metrics_root = tmp_path / "metrics"
+    monkeypatch.setattr(runner, "METRICS_ROOT", metrics_root)
+    exp = _experiment()
+    published = metrics_root / exp.name
+    published.mkdir(parents=True)
+    (published / "system_metrics.json").write_text("{}")
+
+    out = tmp_path / "out"
+    runner.withdraw_published(exp, out)
+
+    assert not published.exists()
+    assert list((out / "withdrawn").rglob("system_metrics.json"))
+
+
+def test_run_one_rejects_result_if_source_changes_during_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "ATTEMPTS_ROOT", tmp_path / "attempts")
+    monkeypatch.setattr(runner, "METRICS_ROOT", tmp_path / "metrics")
+    source = _source()
+    changed = {**source, "source_diff_hash": "9" * 16}
+    calls = iter((source, changed))
+    monkeypatch.setattr(
+        runner, "current_source", lambda exclude_paths=(): next(calls)
+    )
+
+    class FakePopen:
+        def __init__(self, *args, **kwargs) -> None:
+            self.pid = 12345
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(runner.subprocess, "Popen", FakePopen)
+    name, row, err, _ = runner.run_one(
+        _experiment(), 1, source, "fingerprint", tmp_path / "out"
+    )
+    assert (name, row) == ("g16_p8_d8_tp2", None)
+    assert "source changed during run" in (err or "")
+
+
+def test_run_one_honours_cancellation_before_spawn(tmp_path: Path) -> None:
     runner.CANCEL_EVENT.set()
     try:
         name, row, err, elapsed = runner.run_one(
-            _experiment(), 1, _source(), "fingerprint"
+            _experiment(), 1, _source(), "fingerprint", tmp_path / "out"
         )
     finally:
         runner.CANCEL_EVENT.clear()

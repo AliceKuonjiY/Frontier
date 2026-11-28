@@ -1031,6 +1031,24 @@ def _terminate_all() -> None:
         _terminate_proc(proc)
 
 
+def withdraw_published(exp: Experiment, output_dir: Path) -> None:
+    """Remove the stable published copy while a rerun is pending.
+
+    Historical artifacts stay under attempts/; readers of the fixed
+    outputs/.../<name> path must not see the previous successful run while the
+    replacement is in progress.
+    """
+    published = METRICS_ROOT / exp.name
+    if not published.exists():
+        return
+    withdrawn = output_dir / "withdrawn" / f"{exp.name}.{time.time_ns()}"
+    withdrawn.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(published, withdrawn)
+    except FileNotFoundError:
+        pass
+
+
 def publish_metrics(src: Path, dst: Path) -> None:
     """Copy one validated attempt to the stable published path.
 
@@ -1065,9 +1083,21 @@ def run_one(
     timeout_s: int,
     source: dict[str, Any],
     run_fp: str,
+    output_dir: Path,
 ) -> tuple[str, dict[str, Any] | None, str | None, float]:
     if CANCEL_EVENT.is_set():
         return exp.name, None, "cancelled", 0.0
+
+    def source_matches() -> bool:
+        return current_source(exclude_paths=[output_dir]) == source
+
+    if not source_matches():
+        return (
+            exp.name,
+            None,
+            "source changed before start; result rejected",
+            0.0,
+        )
 
     ATTEMPTS_ROOT.mkdir(parents=True, exist_ok=True)
     attempt_root = ATTEMPTS_ROOT / (
@@ -1131,6 +1161,8 @@ def run_one(
     elapsed = round(time.time() - t0, 1)
     if CANCEL_EVENT.is_set():
         return exp.name, None, "cancelled", elapsed
+    if not source_matches():
+        return exp.name, None, "source changed during run; result rejected", elapsed
     if rc != 0:
         tail = ""
         try:
@@ -1153,6 +1185,9 @@ def run_one(
         publish_metrics(attempt_result_dir, canonical_dir)
     except Exception as exc:  # noqa: BLE001 - keep the worker alive
         return exp.name, None, f"publish failed: {exc}", elapsed
+    if not source_matches():
+        withdraw_published(exp, output_dir)
+        return exp.name, None, "source changed during publish; result rejected", elapsed
     row.update(source)
     row["config_fingerprint"] = config_fingerprint(exp)
     row["run_fingerprint"] = run_fp
@@ -1169,7 +1204,15 @@ def run_one(
 # ---------------------------------------------------------------------------
 
 
-def git_info() -> dict[str, Any]:
+def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
+    excluded = tuple(p.resolve() for p in exclude_paths)
+
+    def _is_excluded(rel: str) -> bool:
+        if not excluded:
+            return False
+        full = (REPO_ROOT / rel).resolve()
+        return any(full == root or root in full.parents for root in excluded)
+
     def _run(*args: str) -> str:
         try:
             return subprocess.check_output(
@@ -1184,6 +1227,8 @@ def git_info() -> dict[str, Any]:
     diff = _run("diff", "--binary", "HEAD")
     untracked_digest = hashlib.sha256()
     for rel in sorted(filter(None, _run("ls-files", "--others", "--exclude-standard", "-z").split("\0"))):
+        if _is_excluded(rel):
+            continue
         try:
             st = (REPO_ROOT / rel).stat()
         except OSError:
@@ -1207,9 +1252,12 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def current_source(git: dict[str, Any] | None = None) -> dict[str, Any]:
+def current_source(
+    git: dict[str, Any] | None = None,
+    exclude_paths: Iterable[Path] = (),
+) -> dict[str, Any]:
     """Identity of the working tree that produced a result row."""
-    git = git or git_info()
+    git = git or git_info(exclude_paths=exclude_paths)
     status = git.get("status_porcelain", "")
     return {
         "source_commit": git.get("head") or "nogit",
@@ -1500,7 +1548,7 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
         out.append("## M2N 敏感性")
         out.append("")
         out.append(_table(
-            ["配置", "协议", "带宽 Gbps", "延迟 us", "M2N ms", "TPOT", "E2E", "输出 tok/s"],
+            ["配置", "协议", "带宽 Gbps", "延迟 us", "M2N IB 累计 ms", "TPOT", "E2E", "输出 tok/s"],
             [
                 [
                     r.get("name", "—"),
@@ -1515,6 +1563,11 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
                 for r in sorted(m2n, key=lambda x: x["name"])
             ],
         ))
+        out.append("")
+        out.append(
+            "> HostBounce 的 PCIe 拷贝在 FFN CPU-overhead 中计费；"
+            "本列只统计 M2N IB 传输事件。"
+        )
         out.append("")
 
     stream = [r for r in rows if r.get("stage") == "weight_stream"]
@@ -1944,6 +1997,7 @@ def main() -> int:
     METRICS_ROOT = OUT_ROOT / "qwen3_4b" / "offline_batch"
     ATTEMPTS_ROOT = output_dir / "attempts"
     RESULTS_CSV = output_dir / "sweep_results.csv"
+    current_csv = output_dir / "current_results.csv"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1972,8 +2026,8 @@ def main() -> int:
     # working-tree identity match.  A new commit or an uncommitted simulator
     # edit must not silently inherit an older row.
     CANCEL_EVENT.clear()
-    git = git_info()
-    source = current_source(git)
+    git = git_info(exclude_paths=[output_dir])
+    source = current_source(git, exclude_paths=[output_dir])
     all_cfgs = build_all_configs()
     all_run_fps = {c.name: run_fingerprint(c, source) for c in all_cfgs}
     config_fps = {c.name: config_fingerprint(c) for c in selected}
@@ -2054,6 +2108,14 @@ def main() -> int:
         ordered.extend(row for name, row in rows_by_name.items() if name not in seen)
         return ordered
 
+    def current_rows_now() -> list[dict[str, Any]]:
+        pending = {p.stem for p in pending_dir.glob("*.json")}
+        return [
+            r for r in ordered_rows()
+            if r.get("run_fingerprint") == all_run_fps.get(r["name"])
+            and r["name"] not in pending
+        ]
+
     print()
     print(f"输出目录 : {output_dir}")
     print(f"配置数   : {len(selected)}（缓存 {len(selected) - len(to_run)}，待跑 {len(to_run)}）")
@@ -2080,11 +2142,16 @@ def main() -> int:
             ),
             encoding="utf-8",
         )
+        withdraw_published(exp, output_dir)
+
+    # Withdraw stale current-source rows immediately; report scripts must not
+    # keep reading the previous current_results.csv while reruns are pending.
+    save_csv(current_rows_now(), current_csv)
 
     t_start = time.time()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
     futures = {
-        pool.submit(run_one, c, args.timeout, source, run_fps[c.name]): c
+        pool.submit(run_one, c, args.timeout, source, run_fps[c.name], output_dir): c
         for c in to_run
     }
     try:
@@ -2130,12 +2197,7 @@ def main() -> int:
     save_csv(ordered, RESULTS_CSV)
     pending_names = sorted(p.stem for p in pending_dir.glob("*.json"))
     pending_set = set(pending_names)
-    current_rows = [
-        r for r in ordered
-        if r.get("run_fingerprint") == all_run_fps.get(r["name"])
-        and r["name"] not in pending_set
-    ]
-    current_csv = output_dir / "current_results.csv"
+    current_rows = current_rows_now()
     save_csv(current_rows, current_csv)
 
     num_cancelled = max(0, len(to_run) - len(ok_names) - len(failures))

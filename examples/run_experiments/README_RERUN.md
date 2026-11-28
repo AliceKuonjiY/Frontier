@@ -51,6 +51,7 @@ Frontier/outputs/runs/<YYYYmmdd_HHMMSS>_<commit>/
 ├── summaries/<run_id>.md
 ├── commands/<run_id>.txt
 ├── attempts/<name>_<attempt>/   # 每次尝试独占；run.log / command.txt
+├── withdrawn/                  # 待重跑时撤下的旧发布副本
 └── outputs/qwen3_4b/offline_batch/<name>/  # 校验成功后才发布
     ├── system_metrics.json
     ├── request_metrics.csv
@@ -166,6 +167,10 @@ python   = Frontier/.venv/bin/python
 
 如果工作树是 dirty，报告里可以直接写“基于 `<commit>` + 未提交修改”。
 
+批量运行期间请不要继续修改模拟器代码：每个用例启动前和结束后都会重新校验
+源码指纹；如果发现变化，该结果会被拒绝并保持“待重跑”状态，不会混入
+`current_results.csv`。
+
 ## 5. 断点续跑
 
 默认每次运行都会新建 `outputs/runs/<时间戳>_<commit>/`，不会复用旧结果。  
@@ -183,6 +188,8 @@ python   = Frontier/.venv/bin/python
 
 每次尝试启动前会写 `pending/<name>.json`，成功后才删除。中断或失败留下的
 pending 标记会让下次续跑自动重试，并在汇总里标成“待重跑”，不会把旧行当新结果。
+同时固定发布路径 `outputs/.../<name>` 会撤到 `withdrawn/`，避免报告读到上一次结果；
+历史指标仍在 `attempts/` 中。
 
 要强制重跑选中的配置（同一目录内其他 stage 的结果会保留）：
 
