@@ -90,12 +90,37 @@ case "$WEIGHT_STREAM_LAYERS" in
     ;;
 esac
 
+CLI_OVERRIDES_FFN_BUDGET=0
+for arg in "$@"; do
+  case "$arg" in
+    --cluster_config_decode_ffn_replica_config_streamed_ffn_layers|--cluster_config_decode_ffn_replica_config_streamed_ffn_layers=*)
+      echo "ERROR: Do not pass $arg via trailing script arguments; set WEIGHT_STREAM_LAYERS=<0|1|2|3> so the matching stream CPU-overhead table and SRAM guard stay in sync." >&2
+      exit 2
+      ;;
+    --cluster_config_decode_ffn_replica_config_usable_memory_mb|--cluster_config_decode_ffn_replica_config_usable_memory_mb=*|\
+    --cluster_config_decode_ffn_replica_config_planning_overhead_mb|--cluster_config_decode_ffn_replica_config_planning_overhead_mb=*|\
+    --cluster_config_decode_ffn_replica_config_moe_tensor_parallel_size|--cluster_config_decode_ffn_replica_config_moe_tensor_parallel_size=*)
+      CLI_OVERRIDES_FFN_BUDGET=1
+      ;;
+  esac
+done
+
+# Validate HPP2 SRAM budget env inputs before applying the TP16 guard.
+if ! awk -v u="$HPP2_USABLE_MEMORY_MB" -v o="$HPP2_PLANNING_OVERHEAD_MB" \
+  'BEGIN { num = "^[0-9]+(\\.[0-9]+)?$"; exit !(u ~ num && o ~ num && u > 0 && u <= 192 && o >= 0 && o < u) }'; then
+  echo "ERROR: Invalid HPP2 SRAM budget (HPP2_USABLE_MEMORY_MB=${HPP2_USABLE_MEMORY_MB}, HPP2_PLANNING_OVERHEAD_MB=${HPP2_PLANNING_OVERHEAD_MB}); require numeric 0 < usable <= 192 MiB and 0 <= overhead < usable MiB." >&2
+  exit 2
+fi
+
 # Strict binary MiB HPP2 SRAM guard: 170 MiB usable - 10 MiB overhead = 160 MiB.
 # At TP16, stream 0/1 needs 36 * 4,669,440 B = 160.3125 MiB on-chip; fail fast
-# unless the numeric net budget (usable - overhead) is explicitly relaxed above 160.3125 MiB.
+# unless the numeric net budget (usable - overhead) is explicitly relaxed above 160.3125 MiB
+# or trailing CLI flags override decode-FFN budget/TP for MemoryPlanner to validate.
 if [ "$WEIGHT_STREAM_LAYERS" = "0" ] || [ "$WEIGHT_STREAM_LAYERS" = "1" ]; then
-  if awk -v u="$HPP2_USABLE_MEMORY_MB" -v o="$HPP2_PLANNING_OVERHEAD_MB" \
-    'BEGIN { num = "^[0-9]+(\\.[0-9]+)?$"; exit !(u ~ num && o ~ num && u > 0 && u <= 192 && o >= 0 && (u - o) > 160.3125) }'; then
+  if [ "$CLI_OVERRIDES_FFN_BUDGET" = "1" ]; then
+    echo "WARNING: Deferring WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS HPP2 SRAM check to MemoryPlanner due to trailing CLI decode-FFN budget/TP override." >&2
+  elif awk -v u="$HPP2_USABLE_MEMORY_MB" -v o="$HPP2_PLANNING_OVERHEAD_MB" \
+    'BEGIN { exit !((u - o) > 160.3125) }'; then
     echo "WARNING: Running WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS with relaxed HPP2 SRAM budget (usable=${HPP2_USABLE_MEMORY_MB} MiB, overhead=${HPP2_PLANNING_OVERHEAD_MB} MiB; default 170/10 MiB is infeasible)." >&2
   else
     echo "ERROR: WEIGHT_STREAM_LAYERS=$WEIGHT_STREAM_LAYERS requires 160.31 MiB + ${HPP2_PLANNING_OVERHEAD_MB} MiB > ${HPP2_USABLE_MEMORY_MB} MiB usable SRAM (default 170.00 MiB usable / 10.00 MiB overhead, nominal 192 MiB)." >&2

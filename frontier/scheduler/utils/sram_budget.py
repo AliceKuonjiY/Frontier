@@ -21,6 +21,15 @@ from frontier.types import ClusterType, MeasurementType
 _FLOAT_COLS = ("rank_fp8_weight_mb", "sram_headroom_mb")
 _BOOL_COLS = ("sram_fit_170mb", "sram_fit_with_10mb_overhead", "weight_streaming_required")
 SRAM_PROFILE_COLUMNS = _FLOAT_COLS + _BOOL_COLS
+_PRECISION_MIN_BYTES = {
+    "FP4": 0.5,
+    "INT4": 0.5,
+    "FP8": 1.0,
+    "INT8": 1.0,
+    "FP16": 2.0,
+    "BF16": 2.0,
+    "FP32": 4.0,
+}
 
 
 def _pct(numerator: int, denominator: int) -> float:
@@ -61,6 +70,7 @@ class SRAMProfileContract:
     sram_fit_170mb: Optional[bool] = None
     sram_fit_with_10mb_overhead: Optional[bool] = None
     weight_streaming_required: Optional[bool] = None
+    profiling_precision: Optional[str] = None
 
     @property
     def rejects_all_resident(self) -> bool:
@@ -68,6 +78,15 @@ class SRAMProfileContract:
             self.sram_fit_with_10mb_overhead is False
             or self.weight_streaming_required is True
         )
+
+    def rejects_all_resident_for_weight_bytes(
+        self, mlp_weight_bytes_per_element: float
+    ) -> bool:
+        if not self.rejects_all_resident:
+            return False
+        precision_key = (self.profiling_precision or "FP8").strip().upper()
+        min_bytes = _PRECISION_MIN_BYTES.get(precision_key, 1.0)
+        return float(mlp_weight_bytes_per_element) >= min_bytes
 
     def to_metrics_dict(self) -> dict[str, Any]:
         return {
@@ -79,14 +98,47 @@ class SRAMProfileContract:
         }
 
 
+def _effective_mlp_precision_label(model_cfg: Any) -> Optional[str]:
+    if model_cfg is None:
+        return None
+    quant = getattr(model_cfg, "quantization_config", None)
+    quant_method = getattr(quant, "quant_method", None) if quant is not None else None
+    if quant_method:
+        quantized_ops = set(
+            getattr(quant, "quantized_operations", None)
+            or {
+                "attn_pre_proj",
+                "attn_post_proj",
+                "mlp_up_proj",
+                "mlp_down_proj",
+                "moe_grouped_gemm",
+            }
+        )
+        if "mlp_up_proj" in quantized_ops:
+            return str(quant_method).strip().upper()
+    default_prec = (
+        model_cfg.get_default_precision()
+        if hasattr(model_cfg, "get_default_precision")
+        else None
+    )
+    if default_prec is not None:
+        return str(getattr(default_prec, "name", default_prec)).strip().upper()
+    return None
+
+
 def load_sram_profile_contract(
-    file_path: str, tensor_parallel_size: int
+    file_path: str,
+    tensor_parallel_size: int,
+    profiling_precision: Optional[str] = None,
 ) -> Optional[SRAMProfileContract]:
     """Load optional SRAM columns for one TP slice; fail fast on conflicting rows."""
     if not file_path or not os.path.isfile(file_path):
         return None
 
     target_tp = int(tensor_parallel_size)
+    target_precision = (
+        profiling_precision.strip().upper() if profiling_precision else None
+    )
     with open(file_path, encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         fields = set(reader.fieldnames or ())
@@ -95,13 +147,24 @@ def load_sram_profile_contract(
         ):
             return None
 
+        has_precision_col = "profiling_precision" in fields
         observed: dict[str, set[Any]] = {col: set() for col in SRAM_PROFILE_COLUMNS}
+        observed_precisions: set[str] = set()
         matched = 0
         for row in reader:
             raw_tp = (row.get("num_tensor_parallel_workers") or "").strip()
             if not raw_tp or int(float(raw_tp)) != target_tp:
                 continue
+            row_precision = (
+                (row.get("profiling_precision") or "").strip().upper()
+                if has_precision_col
+                else ""
+            )
+            if target_precision and row_precision and row_precision != target_precision:
+                continue
             matched += 1
+            if row_precision:
+                observed_precisions.add(row_precision)
             for col in _FLOAT_COLS:
                 if col in fields:
                     observed[col].add(_parse_float(row.get(col), col, file_path))
@@ -120,6 +183,9 @@ def load_sram_profile_contract(
                 f"Conflicting values for {col!r} at TP={target_tp} in {file_path}: {sorted(vals)}"
             )
         resolved[col] = next(iter(vals)) if vals else None
+    resolved["profiling_precision"] = (
+        next(iter(observed_precisions)) if len(observed_precisions) == 1 else None
+    )
     return SRAMProfileContract(**resolved)
 
 
@@ -149,7 +215,9 @@ def resolve_sram_profile_contract_for_cluster(
         network_device=str(getattr(replica_config, "network_device", "")),
     )
     return load_sram_profile_contract(
-        paths.compute, int(getattr(replica_config, "moe_tensor_parallel_size", 1) or 1)
+        paths.compute,
+        int(getattr(replica_config, "moe_tensor_parallel_size", 1) or 1),
+        profiling_precision=_effective_mlp_precision_label(model_cfg),
     )
 
 

@@ -515,3 +515,73 @@ def test_qwen3_4b_allows_diagnostic_override_for_stream0_with_warning(
     argv = capture_path.read_text(encoding="utf-8").splitlines()
     assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_usable_memory_mb") == "192"
     assert _option_value(argv, "--cluster_config_decode_ffn_replica_config_planning_overhead_mb") == "0"
+
+
+@pytest.mark.parametrize(
+    "extra_env",
+    [
+        {"HPP2_USABLE_MEMORY_MB": "200"},
+        {"HPP2_USABLE_MEMORY_MB": "abc"},
+        {"HPP2_PLANNING_OVERHEAD_MB": "170"},
+    ],
+)
+def test_qwen3_4b_reports_clear_error_for_invalid_sram_budget_env(
+    tmp_path: Path, extra_env: dict[str, str]
+) -> None:
+    env = {
+        **os.environ,
+        "OUT_DIR": (tmp_path / "out").as_posix(),
+        "WEIGHT_STREAM_LAYERS": "0",
+        **extra_env,
+    }
+    result = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode != 0
+    assert "Invalid HPP2 SRAM budget" in result.stderr
+    assert "requires 160.31 MiB" not in result.stderr
+
+
+def test_qwen3_4b_handles_trailing_cli_decode_ffn_overrides(tmp_path: Path) -> None:
+    # Trailing streamed_ffn_layers override is rejected to avoid CPU-overhead table mismatch.
+    env = {**os.environ, "OUT_DIR": (tmp_path / "out").as_posix()}
+    bad = subprocess.run(
+        [
+            "bash",
+            str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh"),
+            "--cluster_config_decode_ffn_replica_config_streamed_ffn_layers",
+            "3",
+        ],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert bad.returncode != 0
+    assert "WEIGHT_STREAM_LAYERS" in bad.stderr
+
+    # Trailing decode-FFN usable budget override defers validation to MemoryPlanner.
+    capture_path = tmp_path / "cli_override.argv"
+    fake_python = tmp_path / "capture_python.sh"
+    fake_python.write_bytes(b"#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE_PATH\"\n")
+    fake_python.chmod(0o755)
+    override_env = {
+        **env,
+        "CAPTURE_PATH": capture_path.as_posix(),
+        "PYTHON_BIN": fake_python.as_posix(),
+        "WEIGHT_STREAM_LAYERS": "0",
+    }
+    ok = subprocess.run(
+        [
+            "bash",
+            str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh"),
+            "--cluster_config_decode_ffn_replica_config_usable_memory_mb",
+            "180",
+        ],
+        cwd=REPO_ROOT, env=override_env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "Deferring" in ok.stderr
+    argv = capture_path.read_text(encoding="utf-8").splitlines()
+    assert argv[-2:] == [
+        "--cluster_config_decode_ffn_replica_config_usable_memory_mb",
+        "180",
+    ]

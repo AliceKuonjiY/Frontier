@@ -209,9 +209,24 @@ def test_decode_ffn_requires_free_activation_capacity(tp, streamed_layers, activ
 def test_profiling_csv_sram_contract_and_diagnostic_override(tmp_path):
     tp16 = load_sram_profile_contract(str(HPP2_LINEAR_CSV), 16)
     assert tp16 is not None
+    assert tp16.profiling_precision == "FP8"
     assert tp16.sram_fit_with_10mb_overhead is False
     assert tp16.weight_streaming_required is True
+    assert load_sram_profile_contract(str(HPP2_LINEAR_CSV), 16, profiling_precision="FP4") is None
     assert load_sram_profile_contract(str(H200_LINEAR_CSV), 8) is None
+
+    # Multi-precision CSV resolves cleanly per precision without false conflict.
+    multi_prec_csv = tmp_path / "multi_prec.csv"
+    multi_prec_csv.write_text(
+        "num_tensor_parallel_workers,profiling_precision,sram_fit_with_10mb_overhead,weight_streaming_required\n"
+        "16,FP8,False,True\n"
+        "16,FP4,True,False\n",
+        encoding="utf-8",
+    )
+    fp8_slice = load_sram_profile_contract(str(multi_prec_csv), 16, profiling_precision="FP8")
+    fp4_slice = load_sram_profile_contract(str(multi_prec_csv), 16, profiling_precision="FP4")
+    assert fp8_slice is not None and fp8_slice.rejects_all_resident and fp8_slice.profiling_precision == "FP8"
+    assert fp4_slice is not None and not fp4_slice.rejects_all_resident and fp4_slice.profiling_precision == "FP4"
 
     bad_csv = tmp_path / "conflict.csv"
     bad_csv.write_text(
@@ -221,36 +236,66 @@ def test_profiling_csv_sram_contract_and_diagnostic_override(tmp_path):
     with pytest.raises(ValueError, match="Conflicting values"):
         load_sram_profile_contract(str(bad_csv), 16)
 
-    # CSV rejects all-resident even when analytical weights fit under default budget.
+    # CSV rejects both stream-0 and stream-1 (same on-chip footprint with staging buffer).
     synthetic_contract = SRAMProfileContract(
         sram_fit_170mb=True, sram_fit_with_10mb_overhead=False, weight_streaming_required=True
     )
-    strict_planner = MemoryPlanner(
-        ffn_replica(0, moe_tensor_parallel_size=32, memory_margin_fraction=0.0),
-        replica=None,
-        cluster_type=ClusterType.DECODE_FFN,
-        sram_profile_contract=synthetic_contract,
-    )
-    with pytest.raises(FrontierMemoryOOMError) as error:
-        strict_planner.get_max_batch_size()
-    assert error.value.reason == "profiling_sram_budget_exceeded"
+    for streamed_layers in (0, 1):
+        strict_planner = MemoryPlanner(
+            ffn_replica(streamed_layers, moe_tensor_parallel_size=32, memory_margin_fraction=0.0),
+            replica=None,
+            cluster_type=ClusterType.DECODE_FFN,
+            sram_profile_contract=synthetic_contract,
+        )
+        with pytest.raises(FrontierMemoryOOMError) as error:
+            strict_planner.get_max_batch_size()
+        assert error.value.reason == "profiling_sram_budget_exceeded"
 
-    # Explicit relaxed override allows diagnostic stream-0 and logs one WARNING.
-    diag_cfg = ffn_replica(0, usable_memory_mb=192.0, planning_overhead_mb=0.0, memory_margin_fraction=0.0)
-    diag_planner = MemoryPlanner(
-        diag_cfg, replica=None, cluster_type=ClusterType.DECODE_FFN, sram_profile_contract=tp16
-    )
-    collector = _RecordCollector()
-    planner_logger = logging.getLogger("frontier.scheduler.utils.memory_planner")
-    planner_logger.addHandler(collector)
+    # FP4 weights (0.5 B/param) are not falsely rejected by an FP8-calibrated CSV contract,
+    # while an FP4-calibrated rejecting contract still applies.
+    fp4_cfg = ffn_replica(0, moe_tensor_parallel_size=16, memory_margin_fraction=0.0)
+    orig_quant_method = fp4_cfg.model_config.quantization_config.quant_method
+    fp4_cfg.model_config.quantization_config.quant_method = "fp4"
     try:
-        assert diag_planner.get_max_batch_size() >= 1
-        assert diag_planner.get_max_batch_size() >= 1
+        assert MemoryPlanner(
+            fp4_cfg, replica=None, cluster_type=ClusterType.DECODE_FFN, sram_profile_contract=tp16
+        ).get_max_batch_size() >= 1
+        fp4_reject_contract = SRAMProfileContract(
+            sram_fit_170mb=True,
+            sram_fit_with_10mb_overhead=False,
+            weight_streaming_required=True,
+            profiling_precision="FP4",
+        )
+        with pytest.raises(FrontierMemoryOOMError) as fp4_oom:
+            MemoryPlanner(
+                fp4_cfg,
+                replica=None,
+                cluster_type=ClusterType.DECODE_FFN,
+                sram_profile_contract=fp4_reject_contract,
+            ).get_max_batch_size()
+        assert fp4_oom.value.reason == "profiling_sram_budget_exceeded"
     finally:
-        planner_logger.removeHandler(collector)
-    warnings = [m for m in collector.messages if "SRAM_BUDGET_DIAGNOSTIC_OVERRIDE" in m]
-    assert len(warnings) == 1
-    assert "sram_fit_with_10mb_overhead=False" in warnings[0]
+        fp4_cfg.model_config.quantization_config.quant_method = orig_quant_method
+
+    # Explicit relaxed override allows diagnostic stream-0 and stream-1 and logs one WARNING each.
+    for streamed_layers in (0, 1):
+        diag_cfg = ffn_replica(
+            streamed_layers, usable_memory_mb=192.0, planning_overhead_mb=0.0, memory_margin_fraction=0.0
+        )
+        diag_planner = MemoryPlanner(
+            diag_cfg, replica=None, cluster_type=ClusterType.DECODE_FFN, sram_profile_contract=tp16
+        )
+        collector = _RecordCollector()
+        planner_logger = logging.getLogger("frontier.scheduler.utils.memory_planner")
+        planner_logger.addHandler(collector)
+        try:
+            assert diag_planner.get_max_batch_size() >= 1
+            assert diag_planner.get_max_batch_size() >= 1
+        finally:
+            planner_logger.removeHandler(collector)
+        warnings = [m for m in collector.messages if "SRAM_BUDGET_DIAGNOSTIC_OVERRIDE" in m]
+        assert len(warnings) == 1
+        assert "sram_fit_with_10mb_overhead=False" in warnings[0]
 
 
 def test_metrics_store_and_scheduler_report_nominal_192_mib_and_usable_170_mib(tmp_path):

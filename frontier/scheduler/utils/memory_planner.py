@@ -382,10 +382,19 @@ class MemoryPlanner:
                 details=details,
             )
 
-        csv_blocks_all_resident = (
+        is_all_resident_footprint = (
             budget.streamed_ffn_layers == 0
+            or (
+                budget.streamed_ffn_layers == 1
+                and budget.staging_buffer_bytes > 0
+            )
+        )
+        csv_blocks_all_resident = (
+            is_all_resident_footprint
             and contract is not None
-            and contract.rejects_all_resident
+            and contract.rejects_all_resident_for_weight_bytes(
+                self._param_counter.get_mlp_parameter_bytes_per_element()
+            )
         )
         if csv_blocks_all_resident and not has_relaxed_override:
             self._raise_memory_oom(
