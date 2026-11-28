@@ -31,7 +31,6 @@ find_python() {
   candidates+=(
     "$WORKSPACE_ROOT/.venv/bin/python"
     "$FRONTIER_ROOT/.venv/bin/python"
-    "/tmp/opencode/frontier-venv/bin/python"
   )
   if command -v python3 >/dev/null 2>&1; then
     candidates+=("$(command -v python3)")

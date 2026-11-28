@@ -49,12 +49,16 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import hashlib
 import json
 import math
 import os
 import platform
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -74,6 +78,13 @@ OUT_ROOT = RUNS_ROOT / "_unset" / "outputs"
 METRICS_ROOT = OUT_ROOT / "qwen3_4b" / "offline_batch"
 LOGS_ROOT = RUNS_ROOT / "_unset" / "logs"
 RESULTS_CSV = RUNS_ROOT / "_unset" / "sweep_results.csv"
+
+# Used by the Ctrl-C path: running children get terminated, queued futures
+# get cancelled, and the checkpoint keeps only results written before the
+# interrupt.
+CANCEL_EVENT = threading.Event()
+_RUNNING_LOCK = threading.Lock()
+_RUNNING_PROCS: set[subprocess.Popen] = set()
 
 REQUIRED_DATA = [
     "data/config/models/Qwen3-4B.json",
@@ -831,6 +842,10 @@ def _deep_get(obj: Any, path: str, default: Any = None) -> Any:
     return cur
 
 
+class IncompleteRunError(RuntimeError):
+    """The simulator exited successfully but did not finish every request."""
+
+
 def extract_metrics(exp: Experiment) -> dict[str, Any] | None:
     base = METRICS_ROOT / exp.name
     sys_path = base / "system_metrics.json"
@@ -856,6 +871,23 @@ def extract_metrics(exp: Experiment) -> dict[str, Any] | None:
     af = system.get("af_pipeline_overlap_statistics", {})
     sim = system.get("simulation_metadata", {})
     preempt = system.get("preemption_statistics", {})
+
+    total_raw = sim.get("total_requests")
+    completed_raw = sim.get("completed_requests")
+    if total_raw is None or completed_raw is None:
+        raise IncompleteRunError(
+            "simulation_metadata missing total_requests/completed_requests"
+        )
+    total_requests = int(total_raw)
+    completed_requests = int(completed_raw)
+    if total_requests != exp.num_req:
+        raise IncompleteRunError(
+            f"simulated {total_requests} requests, expected {exp.num_req}"
+        )
+    if completed_requests != exp.num_req:
+        raise IncompleteRunError(
+            f"completed {completed_requests}/{exp.num_req} requests"
+        )
 
     # 当前 PD-AF 输出没有 cluster_utilization 字段，缺测写 NaN，不写假 0。
     util = system.get("cluster_utilization", system.get("utilization_metrics", {}))
@@ -931,8 +963,8 @@ def extract_metrics(exp: Experiment) -> dict[str, Any] | None:
             "prefill_util": prefill_util,
             "decode_attn_util": decode_attn_util,
             "decode_ffn_util": decode_ffn_util,
-            "total_requests": exp.num_req,
-            "completed_requests": int(sim.get("completed_requests", 0)),
+            "total_requests": total_requests,
+            "completed_requests": completed_requests,
             "preemption_events": int(preempt.get("total_preemption_events", 0)),
             "af_attn_active_ms": float(af.get("decode_attn_active_time_ms", 0.0)),
             "af_ffn_active_ms": float(af.get("decode_ffn_active_time_ms", 0.0)),
@@ -944,7 +976,50 @@ def extract_metrics(exp: Experiment) -> dict[str, Any] | None:
     return row
 
 
-def run_one(exp: Experiment, timeout_s: int) -> tuple[str, dict[str, Any] | None, str | None, float]:
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        proc.wait(timeout=3)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        if os.name == "posix":
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _terminate_all() -> None:
+    with _RUNNING_LOCK:
+        procs = list(_RUNNING_PROCS)
+    for proc in procs:
+        _terminate_proc(proc)
+
+
+def run_one(
+    exp: Experiment,
+    timeout_s: int,
+    source: dict[str, Any],
+    run_fp: str,
+) -> tuple[str, dict[str, Any] | None, str | None, float]:
+    if CANCEL_EVENT.is_set():
+        return exp.name, None, "cancelled", 0.0
+
     LOGS_ROOT.mkdir(parents=True, exist_ok=True)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     log_path = LOGS_ROOT / f"{exp.name}.log"
@@ -957,21 +1032,42 @@ def run_one(exp: Experiment, timeout_s: int) -> tuple[str, dict[str, Any] | None
 
     cmd = build_command(exp)
     t0 = time.time()
+    popen_kwargs: dict[str, Any] = {}
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+
     with log_path.open("w", encoding="utf-8") as logf:
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 env=env,
                 cwd=REPO_ROOT,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
-                timeout=timeout_s,
+                **popen_kwargs,
             )
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
-            rc = -1
-            logf.write(f"\n[TIMEOUT] exceeded {timeout_s}s\n")
+        except OSError as exc:
+            return exp.name, None, f"spawn failed: {exc}", 0.0
+        with _RUNNING_LOCK:
+            _RUNNING_PROCS.add(proc)
+        try:
+            try:
+                rc = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                _terminate_proc(proc)
+                rc = -1
+                logf.write(f"\n[TIMEOUT] exceeded {timeout_s}s\n")
+        finally:
+            with _RUNNING_LOCK:
+                _RUNNING_PROCS.discard(proc)
+
     elapsed = round(time.time() - t0, 1)
+    if CANCEL_EVENT.is_set():
+        return exp.name, None, "cancelled", elapsed
     if rc != 0:
         tail = ""
         try:
@@ -980,9 +1076,17 @@ def run_one(exp: Experiment, timeout_s: int) -> tuple[str, dict[str, Any] | None
         except OSError:
             pass
         return exp.name, None, f"exit={rc}; {tail}", elapsed
-    row = extract_metrics(exp)
+    try:
+        row = extract_metrics(exp)
+    except IncompleteRunError as exc:
+        return exp.name, None, str(exc), elapsed
+    except Exception as exc:  # noqa: BLE001 - keep the worker alive
+        return exp.name, None, f"metrics error: {exc}", elapsed
     if row is None:
         return exp.name, None, "missing metrics files", elapsed
+    row.update(source)
+    row["config_fingerprint"] = config_fingerprint(exp)
+    row["run_fingerprint"] = run_fp
     row["wall_seconds"] = elapsed
     return exp.name, row, None, elapsed
 
@@ -1004,6 +1108,16 @@ def git_info() -> dict[str, Any]:
             return ""
 
     status = _run("status", "--porcelain")
+    diff = _run("diff", "--binary", "HEAD")
+    untracked_digest = hashlib.sha256()
+    for rel in sorted(filter(None, _run("ls-files", "--others", "--exclude-standard", "-z").split("\0"))):
+        try:
+            st = (REPO_ROOT / rel).stat()
+        except OSError:
+            continue
+        untracked_digest.update(rel.encode("utf-8"))
+        untracked_digest.update(str(st.st_size).encode("ascii"))
+        untracked_digest.update(str(st.st_mtime_ns).encode("ascii"))
     return {
         "head": _run("rev-parse", "HEAD"),
         "short_head": _run("rev-parse", "--short", "HEAD"),
@@ -1011,7 +1125,48 @@ def git_info() -> dict[str, Any]:
         "last_commit": _run("log", "-1", "--oneline"),
         "dirty": bool(status),
         "status_porcelain": status,
+        "diff_hash": _sha256_text(diff)[:16],
+        "untracked_hash": untracked_digest.hexdigest()[:16],
     }
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def current_source(git: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Identity of the working tree that produced a result row."""
+    git = git or git_info()
+    status = git.get("status_porcelain", "")
+    return {
+        "source_commit": git.get("head") or "nogit",
+        "source_short_commit": git.get("short_head") or "nogit",
+        "source_branch": git.get("branch") or "",
+        "source_dirty": bool(git.get("dirty")),
+        "source_status_hash": _sha256_text(status)[:16],
+        "source_diff_hash": git.get("diff_hash", ""),
+        "source_untracked_hash": git.get("untracked_hash", ""),
+    }
+
+
+def config_fingerprint(exp: Experiment) -> str:
+    payload = json.dumps(
+        asdict(exp),
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return _sha256_text(payload)
+
+
+def run_fingerprint(exp: Experiment, source: dict[str, Any]) -> str:
+    payload = json.dumps(
+        {"source": source, "config": asdict(exp)},
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return _sha256_text(payload)
 
 
 def load_existing(results_csv: Path) -> dict[str, dict[str, Any]]:
@@ -1027,19 +1182,53 @@ def _csv_safe(value: Any) -> Any:
     return value
 
 
+def _existing_csv_header(results_csv: Path) -> list[str]:
+    if not results_csv.exists():
+        return ["name"]
+    try:
+        with results_csv.open(encoding="utf-8", newline="") as f:
+            return next(csv.reader(f))
+    except (OSError, StopIteration, csv.Error):
+        return ["name"]
+
+
 def save_csv(rows: list[dict[str, Any]], results_csv: Path) -> None:
-    if not rows:
-        return
+    """Atomically publish the checkpoint.
+
+    A crash during a truncate-and-write could otherwise leave a zero-byte or
+    half-written CSV.  The temporary file lives on the same filesystem and is
+    atomically renamed into place.  An empty result set still publishes a
+    header-only CSV, so a failed forced rerun removes its old row instead of
+    leaving a stale one behind.
+    """
     results_csv.parent.mkdir(parents=True, exist_ok=True)
     fieldnames: list[str] = []
     for row in rows:
         for key in row:
             if key not in fieldnames:
                 fieldnames.append(key)
-    with results_csv.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows([{k: _csv_safe(v) for k, v in row.items()} for row in rows])
+    if not fieldnames:
+        fieldnames = _existing_csv_header(results_csv)
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{results_csv.name}.",
+        suffix=".tmp",
+        dir=results_csv.parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows([{k: _csv_safe(v) for k, v in row.items()} for row in rows])
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, results_csv)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _fmt(value: Any, digits: int = 2) -> str:
@@ -1073,9 +1262,11 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
                f"({manifest.get('git', {}).get('branch', '—')})"
                f"{'，工作树有未提交修改' if manifest.get('git', {}).get('dirty') else ''}")
     out.append(f"- profile：`{manifest.get('profile', '—')}`；workers={manifest.get('workers', '—')}")
+    cancelled = int(manifest.get("num_cancelled", 0) or 0)
     out.append(
         f"- 结果 {len(rows)} 条（本次运行 {manifest.get('num_run', '—')}，"
         f"缓存 {manifest.get('num_cached', '—')}）；失败 {len(failures)}"
+        + (f"；中断取消 {cancelled}" if cancelled else "")
     )
     out.append("")
 
@@ -1244,8 +1435,6 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
         ))
         out.append("")
 
-    out.append("## 关键对照")
-    out.append("")
     key_pairs = [
         ("16 卡 8:8", "g16_p8_d8_tp2"),
         ("16 卡 6:10", "g16_p6_d10_tp2"),
@@ -1275,7 +1464,51 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             _fmt(float(r["decode_tokens_per_second"]), 0),
         ])
     if key_rows:
+        out.append("## 关键对照")
+        out.append("")
         out.append(_table(["配置", "TTFT ms", "TPOT ms", "E2E ms", "输出 tok/s"], key_rows))
+        out.append("")
+
+    current_fps = {
+        e.get("name"): e.get("run_fingerprint")
+        for e in manifest.get("experiments", [])
+        if isinstance(e, dict) and e.get("name")
+    }
+    if rows:
+        out.append("## 数据来源")
+        out.append("")
+        provenance_rows = []
+        for r in rows:
+            name = r.get("name", "—")
+            fp = r.get("run_fingerprint")
+            if not fp:
+                state = "无指纹"
+            elif name not in current_fps:
+                state = "未选"
+            elif fp == current_fps.get(name):
+                state = "当前"
+            else:
+                state = "旧/不匹配"
+            provenance_rows.append([
+                name,
+                r.get("source_short_commit", "—"),
+                r.get("source_dirty", "—"),
+                (fp or "—")[:12],
+                state,
+            ])
+        out.append(_table(
+            ["配置", "commit", "dirty", "run_fingerprint", "当前源码"],
+            provenance_rows,
+        ))
+        stale_count = sum(
+            1 for row in provenance_rows if row[4] in ("旧/不匹配", "无指纹")
+        )
+        if stale_count:
+            out.append("")
+            out.append(
+                f"> 注意：本表包含 {stale_count} 条旧源码或无指纹结果，"
+                "不要把它们当作当前模拟器产物。"
+            )
         out.append("")
 
     if failures:
@@ -1304,7 +1537,7 @@ def resolve_output_dir(path: Path | None) -> Path:
     return (RUNS_ROOT / path).resolve()
 
 
-def preflight(profile: str, stages: set[str]) -> None:
+def preflight(profile: str, stages: set[str], selected: list[Experiment]) -> None:
     errors: list[str] = []
     if not (REPO_ROOT / ".git").exists():
         errors.append(f"Frontier 不是 git 仓库：{REPO_ROOT}")
@@ -1313,6 +1546,25 @@ def preflight(profile: str, stages: set[str]) -> None:
     for rel in REQUIRED_DATA:
         if not (REPO_ROOT / rel).exists():
             errors.append(f"缺少 profiling 文件：{rel}")
+
+    # The streamed-weight CPU-overhead tables are scenario-specific.  Missing
+    # tables must fail before any run: the predictor would otherwise price the
+    # HostBounce PCIe segment as zero for that stream depth.
+    missing_stream_tables: dict[str, list[str]] = {}
+    for exp in selected:
+        if exp.skip_cpu_overhead or exp.weight_stream_layers not in (1, 2, 3):
+            continue
+        rel = (
+            "data/profiling/cpu_overhead/hpp2_16rank/Qwen3-4B/"
+            f"cpu_overheads_kernel_only_stream{exp.weight_stream_layers}.csv"
+        )
+        if not (REPO_ROOT / rel).exists():
+            missing_stream_tables.setdefault(rel, []).append(exp.name)
+    for rel, names in sorted(missing_stream_tables.items()):
+        errors.append(
+            f"缺少流式 CPU-overhead 表：{rel}（配置：{', '.join(names[:4])}"
+            f"{' 等' if len(names) > 4 else ''}）"
+        )
     try:
         import sklearn  # noqa: F401
         import pandas  # noqa: F401
@@ -1455,7 +1707,7 @@ def main() -> int:
         return 0
 
     stages = {c.stage for c in selected}
-    preflight(args.profile, stages)
+    preflight(args.profile, stages, selected)
 
     if args.dry_run:
         preview_dir = resolve_output_dir(args.output_dir)
@@ -1481,11 +1733,26 @@ def main() -> int:
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
     LOGS_ROOT.mkdir(parents=True, exist_ok=True)
 
-    # Always keep previously written rows.  A subset run (or --force on a
-    # subset) must not delete results from other stages in the same directory.
+    # Results are reusable only when both the experiment config and the
+    # working-tree identity match.  A new commit or an uncommitted simulator
+    # edit must not silently inherit an older row.
+    CANCEL_EVENT.clear()
+    git = git_info()
+    source = current_source(git)
+    config_fps = {c.name: config_fingerprint(c) for c in selected}
+    run_fps = {c.name: run_fingerprint(c, source) for c in selected}
+
     existing = load_existing(RESULTS_CSV)
     rows_by_name: dict[str, dict[str, Any]] = dict(existing)
-    to_run = [c for c in selected if args.force or c.name not in rows_by_name]
+
+    def cache_state(exp: Experiment) -> str:
+        row = rows_by_name.get(exp.name)
+        if row is None:
+            return "missing"
+        return "current" if row.get("run_fingerprint") == run_fps[exp.name] else "stale"
+
+    stale = [c for c in selected if cache_state(c) == "stale"]
+    to_run = [c for c in selected if args.force or cache_state(c) != "current"]
 
     manifest: dict[str, Any] = {
         "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -1499,14 +1766,25 @@ def main() -> int:
         "platform": platform.platform(),
         "repo_root": str(REPO_ROOT),
         "output_dir": str(output_dir),
-        "git": git_info(),
+        "git": git,
+        "source": source,
         "num_selected": len(selected),
         "num_run": len(to_run),
         "num_cached": len(selected) - len(to_run),
+        "num_stale": 0 if args.force else len(stale),
         "num_ok": 0,
         "num_failed": 0,
+        "num_cancelled": 0,
+        "interrupted": False,
         "failures": [],
-        "experiments": [asdict(c) for c in selected],
+        "experiments": [
+            {
+                **asdict(c),
+                "config_fingerprint": config_fps[c.name],
+                "run_fingerprint": run_fps[c.name],
+            }
+            for c in selected
+        ],
     }
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1524,43 +1802,68 @@ def main() -> int:
     print()
     print(f"输出目录 : {output_dir}")
     print(f"配置数   : {len(selected)}（缓存 {len(selected) - len(to_run)}，待跑 {len(to_run)}）")
+    if stale and not args.force:
+        print(f"旧结果   : {len(stale)} 个源码/配置指纹不匹配，将重跑")
     print(f"workers  : {args.workers}")
     print()
 
     failures: list[tuple[str, str]] = []
+    ok_names: set[str] = set()
     done = 0
+    interrupted = False
     t_start = time.time()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
+    futures = {
+        pool.submit(run_one, c, args.timeout, source, run_fps[c.name]): c
+        for c in to_run
+    }
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(run_one, c, args.timeout): c for c in to_run}
-            for future in concurrent.futures.as_completed(futures):
-                done += 1
+        for future in concurrent.futures.as_completed(futures):
+            done += 1
+            exp = futures[future]
+            try:
                 name, row, err, elapsed = future.result()
-                if err:
-                    failures.append((name, err))
-                    # A forced rerun that fails must not leave a stale row
-                    # that looks like the new simulator produced it.
-                    rows_by_name.pop(name, None)
-                    save_csv(ordered_rows(), RESULTS_CSV)
-                    print(f"[{done}/{len(to_run)}] FAIL {name}: {err} ({elapsed}s)", flush=True)
-                else:
-                    rows_by_name[name] = row
-                    save_csv(ordered_rows(), RESULTS_CSV)
-                    print(
-                        f"[{done}/{len(to_run)}] OK   {name:46s} ({elapsed:6.1f}s) | "
-                        f"TTFT={row['ttft_mean_ms']:7.2f}ms TPOT={row['tpot_mean_ms']:6.3f}ms "
-                        f"E2E={row['e2e_mean_ms']:7.1f}ms out_tps={row['decode_tokens_per_second']:8.0f}",
-                        flush=True,
-                    )
+            except Exception as exc:  # noqa: BLE001 - report worker crash
+                name, row, err, elapsed = exp.name, None, f"worker crashed: {exc}", 0.0
+            if err:
+                failures.append((name, err))
+                # A forced rerun that fails must not leave a stale row that
+                # looks like the new simulator produced it.
+                rows_by_name.pop(name, None)
+                save_csv(ordered_rows(), RESULTS_CSV)
+                print(f"[{done}/{len(to_run)}] FAIL {name}: {err} ({elapsed}s)", flush=True)
+            else:
+                rows_by_name[name] = row
+                ok_names.add(name)
+                save_csv(ordered_rows(), RESULTS_CSV)
+                print(
+                    f"[{done}/{len(to_run)}] OK   {name:46s} ({elapsed:6.1f}s) | "
+                    f"TTFT={row['ttft_mean_ms']:7.2f}ms TPOT={row['tpot_mean_ms']:6.3f}ms "
+                    f"E2E={row['e2e_mean_ms']:7.1f}ms out_tps={row['decode_tokens_per_second']:8.0f}",
+                    flush=True,
+                )
     except KeyboardInterrupt:
-        print("\n收到 Ctrl-C：保存已完成结果并退出。", file=sys.stderr)
+        interrupted = True
+        print(
+            "\n收到 Ctrl-C：取消排队任务、终止在跑仿真，并保存已完成结果。",
+            file=sys.stderr,
+        )
+        CANCEL_EVENT.set()
+        for future in futures:
+            future.cancel()
+        _terminate_all()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
     ordered = ordered_rows()
     save_csv(ordered, RESULTS_CSV)
 
+    num_cancelled = max(0, len(to_run) - len(ok_names) - len(failures))
     manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
-    manifest["num_ok"] = len(to_run) - len(failures)
+    manifest["num_ok"] = len(ok_names)
     manifest["num_failed"] = len(failures)
+    manifest["num_cancelled"] = num_cancelled if interrupted else 0
+    manifest["interrupted"] = interrupted
     manifest["num_results"] = len(ordered)
     manifest["failures"] = [{"name": n, "error": e} for n, e in failures]
     manifest["elapsed_s"] = round(time.time() - t_start, 1)
@@ -1571,12 +1874,15 @@ def main() -> int:
 
     print()
     print(
-        f"完成：本次运行 {len(to_run) - len(failures)} 成功，{len(failures)} 失败；"
+        f"完成：本次运行 {len(ok_names)} 成功，{len(failures)} 失败，"
+        f"{manifest['num_cancelled']} 取消；"
         f"目录共 {len(ordered)} 条结果（缓存 {len(selected) - len(to_run)}）"
     )
     print(f"结果 CSV : {RESULTS_CSV}")
     print(f"汇总报告 : {summary_path}")
     print(f"运行清单 : {manifest_path}")
+    if interrupted:
+        return 130
     if failures:
         print("\n失败列表：")
         for name, err in failures:

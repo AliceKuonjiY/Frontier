@@ -171,8 +171,12 @@ python   = Frontier/.venv/bin/python
 ./run_experiments.sh --output-dir 20261128_101500_9e4fa41
 ```
 
-已出现在 `sweep_results.csv` 里的配置会跳过；要强制重跑选中的配置
-（同一目录内其他 stage 的结果会保留）：
+已出现在 `sweep_results.csv` 里的配置会跳过，但只有
+`run_fingerprint`（git commit + 未提交 diff + 实验参数）完全一致时才复用。
+如果模拟器或参数改过，旧行会自动重跑；`summary.md` 的“数据来源”表会标记
+每条结果是“当前 / 旧不匹配 / 未选”。
+
+要强制重跑选中的配置（同一目录内其他 stage 的结果会保留）：
 
 ```bash
 ./run_experiments.sh --output-dir 20261128_101500_9e4fa41 --force
@@ -205,6 +209,11 @@ cd /home/yhu/Desktop/scale/Frontier
 - 400 请求 Poisson 用 `pois_g16_tp2_af4_qps250_n400`，不要拿 64 请求点代替。
 
 本脚本的 CSV 已包含这些列；缺测的利用率会写 `NA`。
+只有 `simulation_metadata.total_requests` 和 `completed_requests` 都等于配置
+请求数时，该行才会写入成功结果；退出码为 0 但请求未跑完会记为失败。
+
+按 Ctrl-C 会取消排队任务、终止在跑子进程，按已写入的结果收尾，并以退出码
+`130` 返回；CSV 使用同目录临时文件原子替换，零结果时也会留下表头。
 
 ## 7. 环境准备
 
@@ -213,8 +222,10 @@ cd /home/yhu/Desktop/scale/Frontier
 1. `PYTHON_BIN`
 2. `scale/.venv/bin/python`
 3. `Frontier/.venv/bin/python`
-4. `/tmp/opencode/frontier-venv/bin/python`
-5. 系统 `python3`
+4. 系统 `python3`
+
+不再自动执行共享 `/tmp` 下的解释器；临时虚拟环境请通过
+`PYTHON_BIN=/path/to/python` 显式指定。
 
 推荐在 `Frontier` 下建 uv 环境：
 
