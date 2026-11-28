@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import csv
 import dataclasses
 import importlib.util
@@ -64,6 +65,54 @@ def test_fingerprints_change_with_config_and_source() -> None:
     assert run_fp != runner.run_fingerprint(
         exp, {**source, "source_environment_fingerprint": "4" * 16}
     )
+
+
+@pytest.mark.parametrize(
+    ("request_scale", "expected_scale"),
+    [(1.0, 1.0), (0.001, 1000.0)],
+)
+def test_extract_metrics_converts_request_times_to_ms(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_scale: float,
+    expected_scale: float,
+) -> None:
+    exp = _experiment("verify_baseline_stream0")
+    base = tmp_path / exp.name
+    base.mkdir()
+    system = {
+        "simulation_metadata": {"total_requests": 8, "completed_requests": 8},
+        "ttft_statistics": {"mean": 21.3, "p50": 21.3, "p90": 21.3, "p99": 21.3},
+        "tpot_statistics": {"mean": 1.7, "p50": 1.7, "p90": 1.7, "p99": 1.7},
+        "request_e2e_time_statistics": {
+            "mean": 128.6,
+            "p90": 128.6,
+            "max": 128.6,
+        },
+        "throughput_metrics": {
+            "total_duration_ms": 128.6,
+            "requests_per_second": 62.2,
+            "tokens_per_second": 35818.0,
+            "decode_tokens_per_second": 3979.8,
+        },
+    }
+    (base / "system_metrics.json").write_text(json.dumps(system))
+    (base / "request_metrics.csv").write_text(
+        "Request Id,prefill_e2e_time,cluster_decode_attn_e2e_time,"
+        "cluster_decode_ffn_e2e_time,ttft_kv_transfer,tpot_transfer\n"
+        f"0,{21.3 * request_scale},{10.0 * request_scale},"
+        f"{2.0 * request_scale},{0.2 * request_scale},{0.1 * request_scale}\n"
+    )
+    monkeypatch.setattr(runner, "METRICS_ROOT", tmp_path)
+
+    row = runner.extract_metrics(exp)
+    assert row is not None
+    assert row["request_time_scale"] == expected_scale
+    assert row["prefill_e2e_mean_ms"] == pytest.approx(21.3)
+    assert row["decode_attn_e2e_mean_ms"] == pytest.approx(10.0)
+    assert row["decode_ffn_e2e_mean_ms"] == pytest.approx(2.0)
+    assert row["ttft_kv_transfer_mean_ms"] == pytest.approx(0.2)
+    assert row["tpot_transfer_mean_ms"] == pytest.approx(0.1)
 
 
 def test_extract_metrics_rejects_incomplete_requests(
@@ -166,6 +215,35 @@ def test_git_info_excludes_output_dir_from_status_and_diff(
 def test_runtime_dependency_preflight_includes_plotly() -> None:
     assert "plotly" in runner.RUNTIME_MODULES
     assert "ddsketch" in runner.RUNTIME_MODULES
+
+
+def test_environment_identity_includes_venv_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = runner.environment_identity()
+    assert first["source_python_prefix"]
+    assert first["source_sklearn_location"]
+    monkeypatch.setattr(runner.sys, "prefix", "/tmp/other-venv")
+    second = runner.environment_identity()
+    assert second["source_python_prefix"] == "/tmp/other-venv"
+    assert first["source_environment_fingerprint"] != second["source_environment_fingerprint"]
+
+
+def test_latest_by_name_skips_blank_rows() -> None:
+    rows = [
+        {"name": None, "run_fingerprint": None},
+        {"name": "", "run_fingerprint": "fp"},
+        {"name": "x", "run_fingerprint": "fp"},
+    ]
+    latest = runner.latest_by_name(rows)
+    assert set(latest) == {"x"}
+
+
+def test_git_info_is_serialized_across_workers() -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        snapshots = list(pool.map(lambda _: runner.git_info(), range(8)))
+    assert all(snapshot["available"] for snapshot in snapshots)
+    assert len({snapshot["head"] for snapshot in snapshots}) == 1
 
 
 def test_git_info_marks_missing_repository_unavailable(
@@ -317,26 +395,58 @@ def test_pending_marker_requires_matching_fingerprint(tmp_path: Path) -> None:
     assert not runner.pending_marker_active(marker, "fp-a")
 
 
-def test_ensure_published_rejects_empty_paths(tmp_path: Path) -> None:
-    published = tmp_path / "published"
-    assert not runner.published_matches({})
-    assert not runner.ensure_published({})
+def test_ensure_published_rejects_empty_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "run"
+    exp = _experiment()
+    monkeypatch.setattr(
+        runner, "METRICS_ROOT", out / "outputs" / "qwen3_4b" / "offline_batch"
+    )
+    published = out / "outputs" / "qwen3_4b" / "offline_batch" / exp.name
+    assert not runner.published_matches({}, out, exp)
+    assert not runner.ensure_published({}, out, exp)
     assert not runner.ensure_published(
-        {"metrics_dir": "", "published_dir": str(published)}
+        {"metrics_dir": "", "published_dir": str(published)}, out, exp
     )
     assert not runner.ensure_published(
-        {"metrics_dir": None, "published_dir": str(published)}
+        {"metrics_dir": None, "published_dir": str(published)}, out, exp
+    )
+    assert not published.exists()
+
+    partial = out / "attempts" / "partial" / "metrics"
+    partial.mkdir(parents=True)
+    (partial / "system_metrics.json").write_text("{}")
+    assert not runner.ensure_published(
+        {"metrics_dir": str(partial), "published_dir": str(published)}, out, exp
+    )
+    assert not published.exists()
+
+    external = tmp_path / "external" / "metrics"
+    external.mkdir(parents=True)
+    (external / "system_metrics.json").write_text("{}")
+    (external / "request_metrics.csv").write_text("Request Id\n")
+    assert not runner.ensure_published(
+        {"metrics_dir": str(external), "published_dir": str(published)}, out, exp
     )
     assert not published.exists()
 
 
-def test_ensure_published_restores_matching_attempt(tmp_path: Path) -> None:
-    attempt_a = tmp_path / "attempts" / "a" / "metrics"
-    attempt_b = tmp_path / "attempts" / "b" / "metrics"
+def test_ensure_published_restores_matching_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "run"
+    metrics_root = out / "outputs" / "qwen3_4b" / "offline_batch"
+    monkeypatch.setattr(runner, "METRICS_ROOT", metrics_root)
+    exp = _experiment()
+    attempt_a = out / "attempts" / "a" / "metrics"
+    attempt_b = out / "attempts" / "b" / "metrics"
     for attempt, value in ((attempt_a, "A"), (attempt_b, "B")):
         attempt.mkdir(parents=True)
         (attempt / "value.txt").write_text(value)
-    published = tmp_path / "published"
+        (attempt / "system_metrics.json").write_text("{}")
+        (attempt / "request_metrics.csv").write_text("Request Id\n")
+    published = metrics_root / exp.name
     row_a = {
         "metrics_dir": str(attempt_a),
         "published_dir": str(published),
@@ -348,12 +458,17 @@ def test_ensure_published_restores_matching_attempt(tmp_path: Path) -> None:
         "run_fingerprint": "fp-b",
     }
 
-    assert runner.ensure_published(row_b)
+    assert runner.ensure_published(row_b, out, exp)
     assert (published / "value.txt").read_text() == "B"
-    assert runner.ensure_published(row_a)
+    assert runner.ensure_published(row_a, out, exp)
     assert (published / "value.txt").read_text() == "A"
-    assert runner.published_matches(row_a)
-    assert not runner.published_matches(row_b)
+    assert runner.published_matches(row_a, out, exp)
+    assert not runner.published_matches(row_b, out, exp)
+
+    (published / "request_metrics.csv").unlink()
+    assert not runner.published_matches(row_a, out, exp)
+    assert runner.ensure_published(row_a, out, exp)
+    assert (published / "request_metrics.csv").is_file()
 
 
 def test_withdraw_published_moves_fixed_metrics_path(

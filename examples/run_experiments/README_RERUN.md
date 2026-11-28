@@ -246,6 +246,10 @@ cd <path-to-Frontier>
 `throughput_metrics` 出现 `error` 或缺少必需数值键时同样记为失败，不会写成 0；
 可选分位数缺测写 `NaN`。
 
+`request_metrics.csv` 的请求级耗时列在当前模拟器中是毫秒；导出时用 TTFT 做同量
+校验，若检测到旧文件仍是秒（prefill 比 TTFT 小约 1000 倍），会统一换算并记录
+`request_time_scale=1000`。
+
 按 Ctrl-C 会取消排队任务、终止在跑子进程，按已写入的结果收尾，并以退出码
 `130` 返回；CSV 使用同目录临时文件原子替换，零结果时也会留下表头。
 

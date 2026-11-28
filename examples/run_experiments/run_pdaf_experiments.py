@@ -66,6 +66,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version as package_version
+from importlib.util import find_spec
 
 try:
     import fcntl
@@ -103,6 +104,7 @@ RESULTS_CSV = RUNS_ROOT / "_unset" / "sweep_results.csv"
 CANCEL_EVENT = threading.Event()
 _RUNNING_LOCK = threading.Lock()
 _RUNNING_PROCS: set[subprocess.Popen] = set()
+_GIT_LOCK = threading.Lock()
 
 RUNTIME_MODULES = (
     "ddsketch",
@@ -978,6 +980,21 @@ def extract_metrics(
         ),
         required=True,
     )
+    ttft_mean_ms = stat(ttft, "mean")
+    prefill_request_mean = mean_col("prefill_e2e_time")
+    # request_metrics.csv stores simulation time in milliseconds in this
+    # codebase.  Keep a same-quantity guard: if a legacy/partial metrics file
+    # stores seconds, prefill_e2e_time is ~1000x smaller than TTFT.
+    request_time_scale = 1.0
+    if (
+        math.isfinite(prefill_request_mean)
+        and prefill_request_mean > 0
+        and math.isfinite(ttft_mean_ms)
+        and ttft_mean_ms > 0
+        and prefill_request_mean < ttft_mean_ms / 100.0
+    ):
+        request_time_scale = 1000.0
+
     m2n = system.get("m2n_transfer_statistics", {})
     kv = system.get("kv_cache_transfer_statistics", {})
     af = system.get("af_pipeline_overlap_statistics", {})
@@ -1030,7 +1047,7 @@ def extract_metrics(
             "p_card_ratio": round(exp.p_card_ratio, 4),
             "effective_prefill_max_tokens": effective_prefill_max,
             "effective_decode_attn_max_tokens": effective_decode_attn_max,
-            "ttft_mean_ms": stat(ttft, "mean"),
+            "ttft_mean_ms": ttft_mean_ms,
             "ttft_p50_ms": stat(ttft, "p50"),
             "ttft_p90_ms": stat(ttft, "p90"),
             "ttft_p99_ms": stat(ttft, "p99"),
@@ -1046,11 +1063,12 @@ def extract_metrics(
             "decode_tokens_per_second": out_tps,
             "decode_tps_per_gpu": out_tps / exp.h200_total_cards if exp.h200_total_cards else float("nan"),
             "total_duration_ms": makespan_ms,
-            "decode_attn_e2e_mean_ms": mean_col("cluster_decode_attn_e2e_time"),
-            "decode_ffn_e2e_mean_ms": mean_col("cluster_decode_ffn_e2e_time"),
-            "prefill_e2e_mean_ms": mean_col("prefill_e2e_time"),
-            "ttft_kv_transfer_mean_ms": mean_col("ttft_kv_transfer"),
-            "tpot_transfer_mean_ms": mean_col("tpot_transfer"),
+            "decode_attn_e2e_mean_ms": mean_col("cluster_decode_attn_e2e_time") * request_time_scale,
+            "decode_ffn_e2e_mean_ms": mean_col("cluster_decode_ffn_e2e_time") * request_time_scale,
+            "prefill_e2e_mean_ms": prefill_request_mean * request_time_scale,
+            "ttft_kv_transfer_mean_ms": mean_col("ttft_kv_transfer") * request_time_scale,
+            "tpot_transfer_mean_ms": mean_col("tpot_transfer") * request_time_scale,
+            "request_time_scale": request_time_scale,
             "m2n_total_ms": float(m2n.get("total_transfer_time_ms", 0.0)),
             "m2n_bytes": int(m2n.get("total_data_transferred_bytes", 0)),
             "m2n_transfers": int(m2n.get("total_transfers", 0)),
@@ -1122,13 +1140,60 @@ def write_publish_marker(row: dict[str, Any]) -> None:
     )
 
 
-def published_matches(row: dict[str, Any]) -> bool:
+def metrics_complete(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and (path / "system_metrics.json").is_file()
+        and (path / "request_metrics.csv").is_file()
+    )
+
+
+def safe_row_paths(
+    row: dict[str, Any],
+    output_dir: Path,
+    exp: Experiment,
+) -> tuple[Path, Path] | None:
+    """Validate historical row paths against the current output root."""
     if not row:
-        return False
+        return None
+    raw_src = row.get("metrics_dir")
     raw_dst = row.get("published_dir")
-    if not isinstance(raw_dst, str) or not raw_dst.strip():
+    if (
+        not isinstance(raw_src, str)
+        or not raw_src.strip()
+        or not isinstance(raw_dst, str)
+        or not raw_dst.strip()
+    ):
+        return None
+    try:
+        src = Path(raw_src).resolve()
+        dst = Path(raw_dst).resolve()
+        attempts_root = (output_dir / "attempts").resolve()
+        expected_dst = (METRICS_ROOT / exp.name).resolve()
+    except (OSError, ValueError):
+        return None
+    if dst != expected_dst:
+        return None
+    try:
+        src.relative_to(attempts_root)
+    except ValueError:
+        return None
+    if not metrics_complete(src):
+        return None
+    return src, dst
+
+
+def published_matches(
+    row: dict[str, Any],
+    output_dir: Path,
+    exp: Experiment,
+) -> bool:
+    paths = safe_row_paths(row, output_dir, exp)
+    if paths is None:
         return False
-    dst = Path(raw_dst)
+    _, dst = paths
+    if not metrics_complete(dst):
+        return False
     meta_path = dst / "publish_metadata.json"
     if not meta_path.is_file():
         return False
@@ -1142,24 +1207,19 @@ def published_matches(row: dict[str, Any]) -> bool:
     )
 
 
-def ensure_published(row: dict[str, Any]) -> bool:
+def ensure_published(
+    row: dict[str, Any],
+    output_dir: Path,
+    exp: Experiment,
+) -> bool:
     if not row:
         return False
-    if published_matches(row):
+    if published_matches(row, output_dir, exp):
         return True
-    raw_src = row.get("metrics_dir")
-    raw_dst = row.get("published_dir")
-    if (
-        not isinstance(raw_src, str)
-        or not raw_src.strip()
-        or not isinstance(raw_dst, str)
-        or not raw_dst.strip()
-    ):
+    paths = safe_row_paths(row, output_dir, exp)
+    if paths is None:
         return False
-    src = Path(raw_src)
-    dst = Path(raw_dst)
-    if not src.is_dir():
-        return False
+    src, dst = paths
     try:
         publish_metrics(src, dst)
         write_publish_marker(row)
@@ -1338,6 +1398,11 @@ def run_one(
 
 
 def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
+    with _GIT_LOCK:
+        return _git_info_locked(exclude_paths)
+
+
+def _git_info_locked(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
     excluded = tuple(p.resolve() for p in exclude_paths)
 
     def _is_excluded(rel: str) -> bool:
@@ -1346,18 +1411,31 @@ def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
         full = (REPO_ROOT / rel).resolve()
         return any(full == root or root in full.parents for root in excluded)
 
-    def _run(*args: str, text: bool = True):
-        try:
-            kwargs = {"stderr": subprocess.DEVNULL}
-            if text:
-                kwargs.update(text=True, errors="replace")
-            output = subprocess.check_output(
-                ["git", "-C", str(REPO_ROOT), *args],
-                **kwargs,
-            )
-            return output.strip() if text else output
-        except (OSError, subprocess.CalledProcessError):
-            return "" if text else b""
+    def _run(*args: str, text: bool = True, required: bool = False):
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                kwargs = {"stderr": subprocess.DEVNULL}
+                if text:
+                    kwargs.update(text=True, errors="replace")
+                output = subprocess.check_output(
+                    [
+                        "git",
+                        "--no-optional-locks",
+                        "-C",
+                        str(REPO_ROOT),
+                        *args,
+                    ],
+                    **kwargs,
+                )
+                return output.strip() if text else output
+            except (OSError, subprocess.CalledProcessError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.05 * (attempt + 1))
+        if required:
+            raise RuntimeError(f"git {' '.join(args)} failed after retries: {last_error}")
+        return "" if text else b""
 
     pathspec: list[str] = []
     for root in excluded:
@@ -1368,11 +1446,42 @@ def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
         if rel == Path("."):
             continue
         pathspec.append(f":(exclude,top){rel.as_posix()}")
+    head = _run("rev-parse", "HEAD")
+    if not head:
+        if (REPO_ROOT / ".git").exists():
+            raise RuntimeError(
+                "git rev-parse HEAD failed inside an existing repository"
+            )
+        return {
+            "head": "",
+            "short_head": "",
+            "branch": "",
+            "last_commit": "",
+            "dirty": False,
+            "status_porcelain": "",
+            "diff_hash": _sha256_bytes(b"")[:16],
+            "untracked_hash": _sha256_bytes(b"")[:16],
+            "available": False,
+        }
+
     source_scope = ["--", ".", *pathspec] if pathspec else []
-    status = _run("status", "--porcelain", *source_scope)
-    diff = _run("diff", "--binary", "HEAD", *source_scope, text=False)
+    status = _run("status", "--porcelain", *source_scope, required=True)
+    diff = _run(
+        "diff", "--binary", "HEAD", *source_scope, text=False, required=True
+    )
     untracked_digest = hashlib.sha256()
-    for rel in sorted(filter(None, _run("ls-files", "--others", "--exclude-standard", "-z").split("\0"))):
+    for rel in sorted(
+        filter(
+            None,
+            _run(
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                required=True,
+            ).split("\0"),
+        )
+    ):
         if _is_excluded(rel):
             continue
         try:
@@ -1383,15 +1492,15 @@ def git_info(exclude_paths: Iterable[Path] = ()) -> dict[str, Any]:
         untracked_digest.update(str(st.st_size).encode("ascii"))
         untracked_digest.update(str(st.st_mtime_ns).encode("ascii"))
     return {
-        "head": _run("rev-parse", "HEAD"),
-        "short_head": _run("rev-parse", "--short", "HEAD"),
+        "head": head,
+        "short_head": head[:7],
         "branch": _run("branch", "--show-current"),
         "last_commit": _run("log", "-1", "--oneline"),
         "dirty": bool(status),
         "status_porcelain": status,
         "diff_hash": _sha256_bytes(diff)[:16],
         "untracked_hash": untracked_digest.hexdigest()[:16],
-        "available": bool(_run("rev-parse", "HEAD")),
+        "available": True,
     }
 
 
@@ -1410,6 +1519,14 @@ def _package_version(name: str) -> str:
         return "missing"
 
 
+def _package_location(module_name: str) -> str:
+    try:
+        spec = find_spec(module_name)
+    except (ImportError, ValueError):
+        return "missing"
+    return str(Path(spec.origin).resolve()) if spec and spec.origin else "missing"
+
+
 def environment_identity() -> dict[str, str]:
     dependencies = {
         "scikit-learn": _package_version("scikit-learn"),
@@ -1417,18 +1534,30 @@ def environment_identity() -> dict[str, str]:
         "pandas": _package_version("pandas"),
         "scipy": _package_version("scipy"),
     }
+    locations = {
+        "scikit-learn": _package_location("sklearn"),
+        "numpy": _package_location("numpy"),
+        "pandas": _package_location("pandas"),
+        "scipy": _package_location("scipy"),
+    }
     payload = {
         "python_version": platform.python_version(),
-        "python_executable": os.path.realpath(sys.executable),
+        "python_entry": os.path.abspath(sys.executable),
+        "python_prefix": os.path.abspath(sys.prefix),
+        "python_realpath": os.path.realpath(sys.executable),
         "dependencies": dependencies,
+        "dependency_locations": locations,
     }
     return {
         "source_python_version": payload["python_version"],
-        "source_python_executable": payload["python_executable"],
+        "source_python_entry": payload["python_entry"],
+        "source_python_prefix": payload["python_prefix"],
+        "source_python_executable": payload["python_realpath"],
         "source_sklearn_version": dependencies["scikit-learn"],
         "source_numpy_version": dependencies["numpy"],
         "source_pandas_version": dependencies["pandas"],
         "source_scipy_version": dependencies["scipy"],
+        "source_sklearn_location": locations["scikit-learn"],
         "source_environment_fingerprint": _sha256_text(
             json.dumps(payload, sort_keys=True, ensure_ascii=False)
         )[:16],
@@ -1517,7 +1646,9 @@ def load_existing_rows(results_csv: Path) -> list[dict[str, Any]]:
 def latest_by_name(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for row in rows:
-        latest[row["name"]] = row
+        name = row.get("name")
+        if name:
+            latest[name] = row
     return latest
 
 
@@ -1630,14 +1761,17 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
         if isinstance(e, dict) and e.get("name")
     }
     pending_set = set(manifest.get("pending", []))
-    # Rankings and calibration views must use only rows produced by the same
-    # source tree and experiment config.  Historical rows stay in the CSV and
-    # in the provenance table, but they do not participate in the tables below.
+    valid_names = set(manifest.get("valid_current_names", current_fps.keys()))
+    invalid_names = set(manifest.get("invalid_current_names", []))
+    # Rankings and calibration views must use only rows whose fixed publication
+    # was validated.  Historical rows stay in the CSV and provenance table.
     rows = [
         r for r in all_rows
         if r.get("run_fingerprint")
         and r["run_fingerprint"] == current_fps.get(r["name"])
+        and r["name"] in valid_names
         and r["name"] not in pending_set
+        and r["name"] not in invalid_names
     ]
     by_name = {r["name"]: r for r in rows}
     out: list[str] = []
@@ -1889,9 +2023,11 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             fp = r.get("run_fingerprint")
             if name in pending_set:
                 state = "待重跑"
+            elif name in invalid_names:
+                state = "指标缺失"
             elif not fp:
                 state = "无指纹"
-            elif fp == current_fps.get(name):
+            elif fp == current_fps.get(name) and name in valid_names:
                 state = "当前"
             else:
                 state = "旧/不匹配"
@@ -1908,7 +2044,7 @@ def write_summary(rows: list[dict[str, Any]], path: Path, manifest: dict[str, An
             provenance_rows,
         ))
         stale_count = sum(
-            1 for row in provenance_rows if row[5] in ("旧/不匹配", "无指纹", "待重跑")
+            1 for row in provenance_rows if row[5] in ("旧/不匹配", "无指纹", "待重跑", "指标缺失")
         )
         if stale_count:
             out.append("")
@@ -2038,12 +2174,16 @@ def preflight(selection_label: str, stages: set[str], selected: list[Experiment]
         errors.append(f"Frontier 不是 git 仓库：{REPO_ROOT}")
     if not (REPO_ROOT / "frontier" / "main.py").exists():
         errors.append(f"找不到 frontier/main.py：{REPO_ROOT}")
-    git_probe = git_info()
-    if not git_probe.get("head"):
-        errors.append(
-            "无法读取 git HEAD；请确认这是完整仓库且 git 可用 "
-            "（无 git 环境不能安全复用实验缓存）"
-        )
+    try:
+        git_probe = git_info()
+    except Exception as exc:  # pragma: no cover - git failure path
+        errors.append(f"git 探测失败：{exc}")
+    else:
+        if not git_probe.get("head"):
+            errors.append(
+                "无法读取 git HEAD；请确认这是完整仓库且 git 可用 "
+                "（无 git 环境不能安全复用实验缓存）"
+            )
     for rel in REQUIRED_DATA:
         if not (REPO_ROOT / rel).exists():
             errors.append(f"缺少 profiling 文件：{rel}")
@@ -2316,8 +2456,10 @@ def main() -> int:
         rows_by_name: dict[str, dict[str, Any]] = latest_by_name(history_rows)
         current_by_name: dict[str, dict[str, Any]] = {}
         for existing_row in history_rows:
-            if existing_row.get("run_fingerprint") == all_run_fps.get(existing_row["name"]):
-                current_by_name[existing_row["name"]] = existing_row
+            row_name = existing_row.get("name")
+            row_fp = existing_row.get("run_fingerprint")
+            if row_name and row_fp and row_fp == all_run_fps.get(row_name):
+                current_by_name[row_name] = existing_row
 
         # The fixed published path may belong to another source snapshot after
         # switching A -> B -> A.  Restore it from the matching immutable attempt.
@@ -2337,7 +2479,10 @@ def main() -> int:
         for name in list(current_by_name):
             if name in pending_now:
                 continue
-            if not ensure_published(current_by_name[name]):
+            exp = cfg_by_name.get(name)
+            if exp is None or not ensure_published(
+                current_by_name[name], output_dir, exp
+            ):
                 del current_by_name[name]
 
         # Withdraw published copies whose source does not match the current
@@ -2354,7 +2499,7 @@ def main() -> int:
                 return "pending"
             row = current_by_name.get(exp.name)
             if row is not None:
-                if ensure_published(row):
+                if ensure_published(row, output_dir, exp):
                     return "current"
                 del current_by_name[exp.name]
             return "stale" if exp.name in rows_by_name else "missing"
@@ -2392,6 +2537,14 @@ def main() -> int:
             "source_fingerprint": source_fp,
             "predictor_cache_dir": str(predictor_cache_dir),
             "current_fingerprints": all_run_fps,
+        "valid_current_names": sorted(current_by_name),
+        "invalid_current_names": sorted(
+            name
+            for name, row in rows_by_name.items()
+            if name not in current_by_name
+            and name not in pending_now
+            and row.get("run_fingerprint") == all_run_fps.get(name)
+        ),
             "num_selected": len(selected),
             "num_run": len(to_run),
             "num_cached": len(selected) - len(to_run),
@@ -2446,15 +2599,18 @@ def main() -> int:
                         ordered.append(row)
             return ordered
 
-        def current_rows_now() -> list[dict[str, Any]]:
+        def current_rows_now(
+            exclude_names: set[str] | None = None,
+        ) -> list[dict[str, Any]]:
             pending = {
                 p.stem
                 for p in pending_dir.glob("*.json")
                 if pending_marker_active(p, all_run_fps.get(p.stem))
             }
+            excluded = pending | (exclude_names or set())
             return [
                 r for r in current_by_name.values()
-                if r["name"] not in pending
+                if r["name"] not in excluded
             ]
 
         print()
@@ -2479,19 +2635,45 @@ def main() -> int:
         # Mark every selected attempt before launching it.  If this process is
         # interrupted or dies, the old row is not treated as current on the next
         # resume; the run is retried instead.
-        for exp in to_run:
-            pending_path(exp).write_text(
-                json.dumps(
-                    {"run_fingerprint": run_fps[exp.name], "run_id": run_id},
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+        # Publish the reduced current view BEFORE creating pending markers or
+        # withdrawing fixed directories.  If the process is interrupted during
+        # preparation, compare.py must not see the old full ten-case CSV.
+        to_run_names = {c.name for c in to_run}
+        try:
+            save_csv(current_rows_now(to_run_names), current_csv)
+            for exp in to_run:
+                pending_path(exp).write_text(
+                    json.dumps(
+                        {"run_fingerprint": run_fps[exp.name], "run_id": run_id},
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            for exp in to_run:
+                withdraw_published(exp, output_dir)
+        except KeyboardInterrupt:
+            print(
+                "\n准备阶段收到 Ctrl-C / SIGTERM：收敛 pending 与发布目录后退出。",
+                file=sys.stderr,
             )
-            withdraw_published(exp, output_dir)
-
-        # Withdraw stale current-source rows immediately; report scripts must not
-        # keep reading the previous current_results.csv while reruns are pending.
-        save_csv(current_rows_now(), current_csv)
+            CANCEL_EVENT.set()
+            try:
+                save_csv(current_rows_now(to_run_names), current_csv)
+            except OSError:
+                pass
+            for exp in to_run:
+                try:
+                    pending_path(exp).write_text(
+                        json.dumps(
+                            {"run_fingerprint": run_fps[exp.name], "run_id": run_id},
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    withdraw_published(exp, output_dir)
+                except OSError:
+                    pass
+            return 130
 
         t_start = time.time()
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.workers)
@@ -2526,14 +2708,15 @@ def main() -> int:
                     if current_source(exclude_paths=[output_dir]) != source:
                         err = "source changed before publish; result rejected"
                     else:
-                        try:
-                            publish_metrics(
-                                Path(row["metrics_dir"]),
-                                Path(row["published_dir"]),
-                            )
-                            write_publish_marker(row)
-                        except Exception as exc:  # noqa: BLE001 - report as failure
-                            err = f"publish failed: {exc}"
+                        paths = safe_row_paths(row, output_dir, exp)
+                        if paths is None:
+                            err = "attempt metrics missing or unsafe for publish"
+                        else:
+                            try:
+                                publish_metrics(*paths)
+                                write_publish_marker(row)
+                            except Exception as exc:  # noqa: BLE001 - report as failure
+                                err = f"publish failed: {exc}"
                     if not err and current_source(exclude_paths=[output_dir]) != source:
                         withdraw_published(exp, output_dir)
                         err = "source changed during publish; result rejected"
@@ -2585,6 +2768,14 @@ def main() -> int:
         save_csv(current_rows, current_csv)
 
         num_cancelled = max(0, len(to_run) - len(ok_names) - len(failures))
+        manifest["valid_current_names"] = sorted(current_by_name)
+        manifest["invalid_current_names"] = sorted(
+            name
+            for name, row in rows_by_name.items()
+            if name not in current_by_name
+            and name not in pending_set
+            and row.get("run_fingerprint") == all_run_fps.get(name)
+        )
         manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
         manifest["num_ok"] = len(ok_names)
         manifest["num_failed"] = len(failures)
