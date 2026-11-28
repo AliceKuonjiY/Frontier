@@ -626,3 +626,10 @@ def test_qwen3_4b_uses_kv_lut_and_placement_guards(tmp_path: Path) -> None:
     )
     assert _option_value(argv_8g, "--cluster_config_prefill_cluster_num_replicas") == "2"
     assert "--analytical_kv_cache_transfer_config_allow_infeasible_placement_override" not in argv_8g
+
+    # Clearing KV_LUT_PATH omits --lut_path and does not require default LUT in REQUIRED
+    argv_manual = _capture_cli(
+        tmp_path, "offline/qwen3_4b_pd_af.sh",
+        env_overrides={"OUT_DIR": (tmp_path / "manual").as_posix(), "KV_LUT_PATH": ""},
+    )
+    assert "--analytical_kv_cache_transfer_config_lut_path" not in argv_manual

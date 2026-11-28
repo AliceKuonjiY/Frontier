@@ -18,12 +18,39 @@ from frontier.config.kv_cache_transfer_config import (
     PD_PLACEMENTS,
 )
 from frontier.logger import init_logger
-from frontier.types import ClusterType
+from frontier.types import ClusterType, NodeSKUType
 
 logger = init_logger(__name__)
 
 GBPS_TO_BYTES_PER_MS = 1e9 / (8.0 * 1000.0)
 _REQUIRED_LUT_COLS = ("link_type", "kv_cache_bytes", "time_stats.kv_cache_transfer.median")
+_NVLINK_NODE_SKUS = frozenset(
+    {
+        NodeSKUType.A40_PAIRWISE_NVLINK,
+        NodeSKUType.A100_PAIRWISE_NVLINK,
+        NodeSKUType.H100_PAIRWISE_NVLINK,
+        NodeSKUType.A100_DGX,
+        NodeSKUType.H100_DGX,
+        NodeSKUType.H200_DGX,
+        NodeSKUType.A800_DGX,
+        NodeSKUType.H800_DGX,
+        NodeSKUType.H20_DGX,
+    }
+)
+_NVLINK_NODE_SKU_NAMES = frozenset(sku.name.lower() for sku in _NVLINK_NODE_SKUS)
+
+
+def _sku_key(cfg: Any, nested_attr: str, raw_attr: str) -> Any:
+    nested = getattr(cfg, nested_attr, None)
+    if hasattr(nested, "get_type"):
+        return nested.get_type()
+    return str(getattr(cfg, raw_attr, "")).strip().lower()
+
+
+def _supports_nvlink_intra_node(node_sku_key: Any) -> bool:
+    if node_sku_key in _NVLINK_NODE_SKUS:
+        return True
+    return isinstance(node_sku_key, str) and node_sku_key.strip().lower() in _NVLINK_NODE_SKU_NAMES
 
 
 def infer_protocol_from_link_type(link_type: str, fallback: str = "rdma") -> str:
@@ -44,7 +71,7 @@ def infer_protocol_from_link_type(link_type: str, fallback: str = "rdma") -> str
 def _link_locality(link_type: str) -> Optional[str]:
     low = link_type.strip().lower()
     is_intra = link_type == DEFAULT_INTRA_NODE_LINK_TYPE or any(
-        k in low for k in ("intranode", "intra_node", "nvlink", "nvswitch")
+        k in low for k in ("intranode", "intra_node", "nvlink", "nvswitch", "xgmi")
     )
     is_inter = link_type == DEFAULT_INTER_NODE_LINK_TYPE or any(
         k in low for k in ("internode", "inter_node", "rdma", "infiniband", "ib_", "_ib", "host_bounce", "hostbounce", "tcp")
@@ -69,6 +96,7 @@ class PDTopologyPlacement:
     decode_devices: int
     devices_per_node: Optional[int]
     infeasibility_reason: Optional[str] = None
+    shared_node_sku: Any = None
 
     @property
     def total_pd_devices(self) -> int:
@@ -108,8 +136,6 @@ class KVCacheTransferLUTCurve:
             return self.fitted_alpha_latency_ms + effective_bytes * slope
         if pricing_mode != "piecewise_linear":
             raise ValueError(f"lut_pricing_mode must be one of {list(LUT_PRICING_MODES)}, got {pricing_mode!r}")
-        if effective_bytes == 0.0:
-            return self.fitted_alpha_latency_ms
         xs, ys = self.points_bytes, self.points_time_ms
         if effective_bytes < xs[0]:
             y0 = min(self.fitted_alpha_latency_ms, ys[0])
@@ -223,10 +249,16 @@ def load_kv_cache_transfer_lut(
         raise ValueError(f"link_type={target!r} not found in {lut_path!r}; available: {sorted(available)}")
 
     dirs = {(r.get("direction") or "").strip() for _, r in rows if (r.get("direction") or "").strip()}
-    if len(dirs) > 1:
-        if expected_direction not in dirs:
+    if dirs:
+        if expected_direction is not None:
+            if expected_direction not in dirs:
+                raise ValueError(
+                    f"Direction mismatch for {target!r} in {lut_path!r}: "
+                    f"expected {expected_direction!r}, found {sorted(dirs)}"
+                )
+            rows = [(ln, r) for ln, r in rows if (r.get("direction") or "").strip() == expected_direction]
+        elif len(dirs) > 1:
             raise ValueError(f"Ambiguous directions {sorted(dirs)} for {target!r} in {lut_path!r}")
-        rows = [(ln, r) for ln, r in rows if (r.get("direction") or "").strip() == expected_direction]
 
     by_bytes: dict[int, float] = {}
     for ln, row in rows:
@@ -282,8 +314,14 @@ def evaluate_pd_node_placement(
     d_cap = int(d_cfg.node_config.num_devices_per_node)
     node_cap = p_cap if p_cap == d_cap else None
 
+    p_dev_key = _sku_key(p_cfg, "device_config", "device")
+    d_dev_key = _sku_key(d_cfg, "device_config", "device")
+    p_net_key = _sku_key(p_cfg, "node_config", "network_device")
+    d_net_key = _sku_key(d_cfg, "node_config", "network_device")
+    shared_node_sku = p_net_key if p_net_key == d_net_key else None
+
     reason: Optional[str] = None
-    if str(p_cfg.device) != str(d_cfg.device) or str(p_cfg.network_device) != str(d_cfg.network_device):
+    if p_dev_key != d_dev_key or p_net_key != d_net_key:
         reason = f"heterogeneous P/D SKU ({p_cfg.device}/{p_cfg.network_device} vs {d_cfg.device}/{d_cfg.network_device})"
     elif node_cap is None:
         reason = f"mismatched P/D node capacities ({p_cap} vs {d_cap})"
@@ -307,21 +345,53 @@ def evaluate_pd_node_placement(
         )
 
     return PDTopologyPlacement(
-        requested_placement, resolved, same_feasible, feasible, override, p_devs, d_devs, node_cap, reason
+        requested_placement, resolved, same_feasible, feasible, override, p_devs, d_devs, node_cap, reason, shared_node_sku
     )
+
+
+def _validate_lut_manual_conflicts(kv_config: Any) -> None:
+    if not (
+        math.isclose(float(kv_config.network_bandwidth_gbps), DEFAULT_NETWORK_BANDWIDTH_GBPS, abs_tol=1e-12)
+        and math.isclose(float(kv_config.network_latency_ms), DEFAULT_NETWORK_LATENCY_MS, abs_tol=1e-12)
+    ):
+        raise ValueError(
+            "Cannot combine kv_cache_transfer lut_path with non-default network_bandwidth_gbps/network_latency_ms; "
+            "use extra_latency_ms for additive latency sensitivity."
+        )
+
+
+def _resolve_requested_placement_with_link(req_pl: Optional[str], exp_link: Optional[str]) -> str:
+    eff_req = req_pl or "auto"
+    if exp_link is not None:
+        loc = _link_locality(exp_link)
+        if req_pl in ("same_node", "cross_node") and loc is not None and loc != req_pl:
+            raise ValueError(f"Conflicting KV transfer settings: pd_placement={req_pl!r} with link_type={exp_link!r}")
+        if req_pl in (None, "auto") and loc is not None:
+            eff_req = loc
+    return eff_req
+
+
+def _validate_explicit_protocol_conflict(resolved_placement: Optional[str], proto: str) -> None:
+    if resolved_placement == "cross_node" and proto.lower() == "nvlink":
+        raise ValueError(
+            "Conflicting KV transfer settings: resolved pd_placement='cross_node' cannot use transfer_protocol='nvlink'"
+        )
 
 
 def build_standalone_kv_transfer_profile(kv_config: Any) -> ResolvedKVCacheTransferProfile:
     """Build a profile when AnalyticalKVCacheTransferPredictor is instantiated without SimulationConfig."""
     lut_path = (getattr(kv_config, "lut_path", None) or "").strip() or None
+    req_pl = getattr(kv_config, "pd_placement", None)
+    exp_link = (getattr(kv_config, "link_type", None) or "").strip() or None
     extra = float(getattr(kv_config, "extra_latency_ms", 0.0) or 0.0)
     if lut_path is not None:
-        link = (getattr(kv_config, "link_type", None) or "").strip() or None
+        _validate_lut_manual_conflicts(kv_config)
+        _resolve_requested_placement_with_link(req_pl, exp_link)
+        link = exp_link
         if link is None:
-            pl = getattr(kv_config, "pd_placement", None)
-            if pl == "same_node":
+            if req_pl == "same_node":
                 link = DEFAULT_INTRA_NODE_LINK_TYPE
-            elif pl == "cross_node":
+            elif req_pl == "cross_node":
                 link = DEFAULT_INTER_NODE_LINK_TYPE
             else:
                 raise ValueError("Standalone predictor with lut_path requires link_type or concrete pd_placement")
@@ -332,6 +402,7 @@ def build_standalone_kv_transfer_profile(kv_config: Any) -> ResolvedKVCacheTrans
             lut_path=lut_path, lut_pricing_mode=kv_config.lut_pricing_mode, lut_curve=curve,
         )
     proto = str(getattr(kv_config, "transfer_protocol", "rdma")).strip() or "rdma"
+    _validate_explicit_protocol_conflict(req_pl, proto)
     return ResolvedKVCacheTransferProfile(
         "analytical_explicit", f"explicit_{proto.lower()}", proto,
         float(kv_config.network_bandwidth_gbps), float(kv_config.network_latency_ms), extra,
@@ -362,28 +433,22 @@ def resolve_kv_cache_transfer_profile(
         )
 
     if lut_path is not None:
-        if not (
-            math.isclose(float(kv_config.network_bandwidth_gbps), DEFAULT_NETWORK_BANDWIDTH_GBPS, abs_tol=1e-12)
-            and math.isclose(float(kv_config.network_latency_ms), DEFAULT_NETWORK_LATENCY_MS, abs_tol=1e-12)
-        ):
-            raise ValueError(
-                "Cannot combine kv_cache_transfer lut_path with non-default network_bandwidth_gbps/network_latency_ms; "
-                "use extra_latency_ms for additive latency sensitivity."
-            )
-        eff_req = req_pl or "auto"
-        if exp_link is not None:
-            loc = _link_locality(exp_link)
-            if req_pl in ("same_node", "cross_node") and loc is not None and loc != req_pl:
-                raise ValueError(f"Conflicting KV transfer settings: pd_placement={req_pl!r} with link_type={exp_link!r}")
-            if req_pl in (None, "auto") and loc is not None:
-                eff_req = loc
-
+        _validate_lut_manual_conflicts(kv_config)
+        eff_req = _resolve_requested_placement_with_link(req_pl, exp_link)
         placement = evaluate_pd_node_placement(
             cluster_config, sys_arch, eff_req, allow_infeasible_override=allow_ov
         )
-        link = exp_link or (
-            DEFAULT_INTRA_NODE_LINK_TYPE if placement.resolved_placement == "same_node" else DEFAULT_INTER_NODE_LINK_TYPE
-        )
+        if exp_link is not None:
+            link = exp_link
+        elif placement.resolved_placement == "same_node":
+            if not _supports_nvlink_intra_node(placement.shared_node_sku):
+                raise ValueError(
+                    f"No default intra-node KV link_type for non-NVLink node SKU "
+                    f"{placement.shared_node_sku!r}; pass explicit lut_path and link_type."
+                )
+            link = DEFAULT_INTRA_NODE_LINK_TYPE
+        else:
+            link = DEFAULT_INTER_NODE_LINK_TYPE
         expected_dir = "prefill_to_decode_attn" if sys_arch == "pd-af-disaggregation" else "prefill_to_decode"
         curve = load_kv_cache_transfer_lut(lut_path, link, expected_direction=expected_dir)
         if placement.diagnostic_override:
@@ -401,8 +466,7 @@ def resolve_kv_cache_transfer_profile(
         cluster_config, sys_arch, req_pl, allow_infeasible_override=allow_ov
     )
     proto = str(getattr(kv_config, "transfer_protocol", "rdma")).strip() or "rdma"
-    if placement.resolved_placement == "cross_node" and proto.lower() == "nvlink":
-        raise ValueError("Conflicting KV transfer settings: resolved pd_placement='cross_node' cannot use transfer_protocol='nvlink'")
+    _validate_explicit_protocol_conflict(placement.resolved_placement, proto)
     if placement.diagnostic_override:
         logger.warning(
             "[KV_PLACEMENT_DIAGNOSTIC_OVERRIDE] Running infeasible same_node (%s) in explicit analytical mode.",

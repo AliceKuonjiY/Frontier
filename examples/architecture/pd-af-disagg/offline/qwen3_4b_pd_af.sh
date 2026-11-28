@@ -81,7 +81,6 @@ REQUIRED=(
   "data/profiling/network/a2f_h200_to_hpp2/m2n_transfer_lut.csv"
   "data/profiling/network/hpp2_16rank/all_reduce.csv"
   "data/profiling/network/hpp2_16rank/weight_stream_lut.csv"
-  "data/profiling/network/h200_prefill_to_decode_attn/kv_cache_transfer_lut.csv"
 )
 for path in "${REQUIRED[@]}"; do
   if [ ! -f "$path" ]; then

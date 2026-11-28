@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import math
 from typing import Optional
 
 from frontier.config.base_poly_config import BasePolyConfig
@@ -16,13 +17,13 @@ DEFAULT_NETWORK_LATENCY_MS = 0.1
 
 
 def _require_positive(value: float | int, field_name: str) -> None:
-    if value <= 0:
-        raise ValueError(f"{field_name} must be > 0, got {value}")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{field_name} must be > 0 and finite, got {value}")
 
 
 def _require_non_negative(value: float | int, field_name: str) -> None:
-    if value < 0:
-        raise ValueError(f"{field_name} must be >= 0, got {value}")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{field_name} must be >= 0 and finite, got {value}")
 
 
 def _require_optional_positive(value: Optional[int], field_name: str) -> None:

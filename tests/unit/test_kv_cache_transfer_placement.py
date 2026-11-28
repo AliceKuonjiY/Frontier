@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -41,7 +42,15 @@ KV_512_BYTES = 36 * 8 * 128 * 2 * 2 * 512  # 75,497,472 B
 
 
 def _pdaf_cluster(
-    p_rep: int, p_tp: int, d_rep: int, d_tp: int, *, d_device: str = "h200", d_net: str = "h200_dgx"
+    p_rep: int,
+    p_tp: int,
+    d_rep: int,
+    d_tp: int,
+    *,
+    p_device: str = "h200",
+    p_net: str = "h200_dgx",
+    d_device: str = "h200",
+    d_net: str = "h200_dgx",
 ) -> ClusterConfig:
     return ClusterConfig(
         num_replicas=None,
@@ -55,8 +64,8 @@ def _pdaf_cluster(
         decode_ffn_cluster_num_replicas=1,
         prefill_replica_config_attn_tensor_parallel_size=p_tp,
         prefill_replica_config_moe_tensor_parallel_size=p_tp,
-        prefill_replica_config_device="h200",
-        prefill_replica_config_network_device="h200_dgx",
+        prefill_replica_config_device=p_device,
+        prefill_replica_config_network_device=p_net,
         decode_attn_replica_config_attn_tensor_parallel_size=d_tp,
         decode_attn_replica_config_device=d_device,
         decode_attn_replica_config_network_device=d_net,
@@ -125,6 +134,85 @@ def test_pd_placement_pdd_and_heterogeneous_sku() -> None:
     hetero = _pdaf_cluster(1, 2, 1, 2, d_device="h100", d_net="h100_dgx")
     ph = link_profile.evaluate_pd_node_placement(hetero, "pd-af-disaggregation", "auto")
     assert ph.same_node_feasible is False and ph.resolved_placement == "cross_node"
+
+    # Case-insensitive SKU strings (and enum-backed configs) resolve to the same physical node SKU
+    stub_cluster = SimpleNamespace(
+        prefill_cluster_num_replicas=2,
+        decode_attn_cluster_num_replicas=2,
+        prefill_replica_config=SimpleNamespace(
+            world_size=2, device="h200", network_device="h200_dgx",
+            node_config=SimpleNamespace(num_devices_per_node=8),
+        ),
+        decode_attn_replica_config=SimpleNamespace(
+            world_size=2, device="H200", network_device="H200_DGX",
+            node_config=SimpleNamespace(num_devices_per_node=8),
+        ),
+    )
+    pm = link_profile.evaluate_pd_node_placement(stub_cluster, "pd-af-disaggregation", "auto")
+    assert pm.same_node_feasible is True and pm.resolved_placement == "same_node"
+
+
+def test_review_hardening_non_nvlink_sku_direction_finite_and_standalone_guards(tmp_path: Path) -> None:
+    # Non-NVLink same_node SKU (MI355X UBB) must not auto-select NVLink_IntraNode
+    mi355x = _pdaf_cluster(1, 2, 1, 2, p_device="mi355x", p_net="mi355x_ubb", d_device="mi355x", d_net="mi355x_ubb")
+    with pytest.raises(ValueError, match="non-NVLink node SKU"):
+        link_profile.resolve_kv_cache_transfer_profile(
+            AnalyticalKVCacheTransferConfig(lut_path=str(QWEN3_KV_LUT), pd_placement="auto"),
+            mi355x, "pd-af-disaggregation",
+        )
+    xgmi_lut = tmp_path / "xgmi.csv"
+    xgmi_lut.write_text(
+        "direction,link_type,kv_cache_bytes,time_stats.kv_cache_transfer.median\n"
+        "prefill_to_decode_attn,xGMI_IntraNode,1000,0.5\n"
+        "prefill_to_decode_attn,xGMI_IntraNode,2000,1.0\n"
+    )
+    resolved_mi = link_profile.resolve_kv_cache_transfer_profile(
+        AnalyticalKVCacheTransferConfig(lut_path=str(xgmi_lut), pd_placement="auto", link_type="xGMI_IntraNode"),
+        mi355x, "pd-af-disaggregation",
+    )
+    assert resolved_mi.link_type == "xGMI_IntraNode" and resolved_mi.placement.resolved_placement == "same_node"
+
+    # Single-direction LUT with wrong direction must be rejected when expected_direction is given
+    rev_lut = tmp_path / "reversed.csv"
+    rev_lut.write_text(
+        "direction,link_type,kv_cache_bytes,time_stats.kv_cache_transfer.median\n"
+        "decode_attn_to_prefill,RDMA_IB_400G_Direct,1000,0.5\n"
+        "decode_attn_to_prefill,RDMA_IB_400G_Direct,2000,1.0\n"
+    )
+    with pytest.raises(ValueError, match="Direction mismatch"):
+        link_profile.load_kv_cache_transfer_lut(
+            str(rev_lut), "RDMA_IB_400G_Direct", expected_direction="prefill_to_decode_attn"
+        )
+
+    # Convex LUT clamps 0-byte intercept to min(alpha, ys[0]) so predict(0) <= predict(1)
+    convex = link_profile.KVCacheTransferLUTCurve("mem", "L", (100, 200), (1.0, 2.0), 100.0, 5.0)
+    assert convex.predict_time_ms(0.0, "piecewise_linear") == pytest.approx(1.0)
+    assert convex.predict_time_ms(0.0, "piecewise_linear") <= convex.predict_time_ms(1.0, "piecewise_linear")
+
+    # Non-finite numeric config values (nan/inf) are rejected
+    for bad_val in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="extra_latency_ms"):
+            AnalyticalKVCacheTransferConfig(extra_latency_ms=bad_val)
+        with pytest.raises(ValueError, match="network_bandwidth_gbps"):
+            AnalyticalKVCacheTransferConfig(network_bandwidth_gbps=bad_val)
+
+    # Standalone predictor enforces the same conflict checks as SimulationConfig resolution
+    with pytest.raises(ValueError, match="Cannot combine kv_cache_transfer lut_path"):
+        AnalyticalKVCacheTransferPredictor(
+            AnalyticalKVCacheTransferConfig(
+                lut_path=str(QWEN3_KV_LUT), link_type="RDMA_IB_400G_Direct", network_bandwidth_gbps=3172.5
+            )
+        )
+    with pytest.raises(ValueError, match="Conflicting KV transfer settings"):
+        AnalyticalKVCacheTransferPredictor(
+            AnalyticalKVCacheTransferConfig(
+                lut_path=str(QWEN3_KV_LUT), pd_placement="same_node", link_type="RDMA_IB_400G_Direct"
+            )
+        )
+    with pytest.raises(ValueError, match="cannot use transfer_protocol='nvlink'"):
+        AnalyticalKVCacheTransferPredictor(
+            AnalyticalKVCacheTransferConfig(pd_placement="cross_node", transfer_protocol="nvlink")
+        )
 
 
 def test_kv_lut_pricing_modes_and_validation(tmp_path: Path) -> None:
