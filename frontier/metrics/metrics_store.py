@@ -2426,11 +2426,14 @@ class MetricsStore:
             system_metrics["prefix_cache_statistics"] = prefix_cache_statistics
 
         # 7. KV Cache Transfer statistics (for disaggregated mode)
+        kv_transfer_profile = getattr(
+            self._simulation_config, "resolved_kv_cache_transfer_profile", None
+        )
         if self._kv_cache_transfer_metrics["transfer_count"] > 0:
             transfer_times = self._kv_cache_transfer_metrics["transfer_times"]
             if len(transfer_times) > 0:
                 transfer_time_values = [y for _, y in transfer_times._data_series]
-                system_metrics["kv_cache_transfer_statistics"] = {
+                kv_transfer_stats = {
                     "total_transfers": self._kv_cache_transfer_metrics[
                         "transfer_count"
                     ],
@@ -2444,6 +2447,9 @@ class MetricsStore:
                         transfer_time_values, "ms"
                     ),
                 }
+                if kv_transfer_profile is not None:
+                    kv_transfer_stats.update(kv_transfer_profile.to_metrics_dict())
+                system_metrics["kv_cache_transfer_statistics"] = kv_transfer_stats
                 system_metrics["kv_cache_transfer_total_bytes"] = (
                     self._kv_cache_transfer_metrics["total_data_transferred"]
                 )
@@ -2590,6 +2596,10 @@ class MetricsStore:
             "system_architecture": self._simulation_config.sys_arch,
             "cluster_configurations": {},
         }
+        if kv_transfer_profile is not None:
+            system_architecture_info["kv_cache_transfer_link"] = (
+                kv_transfer_profile.to_metrics_dict()
+            )
 
         model_weight_memory = {}
         for cluster_type, cluster_config in self._cluster_configs.items():

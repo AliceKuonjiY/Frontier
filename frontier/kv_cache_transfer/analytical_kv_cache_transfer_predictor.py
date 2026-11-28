@@ -1,10 +1,14 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from frontier.attention.memory import get_attention_runtime_kv_layout
 from frontier.attention.gdn.guards import validate_gdn_runtime_support
 from frontier.attention.model_binding import bind_attention_family
 from frontier.config import get_quantization_manager
 from frontier.kv_cache_transfer.base_kv_cache_transfer_predictor import BaseKVCacheTransferPredictor
+from frontier.kv_cache_transfer.link_profile import (
+    ResolvedKVCacheTransferProfile,
+    build_standalone_kv_transfer_profile,
+)
 from frontier.logger import init_logger
 from frontier.types import ClusterType
 
@@ -15,12 +19,25 @@ if TYPE_CHECKING:
 
 
 class AnalyticalKVCacheTransferPredictor(BaseKVCacheTransferPredictor):
-    """Analytical KV cache transfer predictor using bandwidth and latency."""
+    """Analytical and LUT-backed KV cache transfer predictor."""
 
-    def __init__(self, config: "AnalyticalKVCacheTransferConfig") -> None:
+    def __init__(
+        self,
+        config: "AnalyticalKVCacheTransferConfig",
+        resolved_profile: Optional[ResolvedKVCacheTransferProfile] = None,
+    ) -> None:
         super().__init__(config)
         self._config: "AnalyticalKVCacheTransferConfig" = config
         self._logger = init_logger(__name__)
+        self._resolved_profile = (
+            resolved_profile
+            if resolved_profile is not None
+            else build_standalone_kv_transfer_profile(config)
+        )
+
+    @property
+    def resolved_profile(self) -> ResolvedKVCacheTransferProfile:
+        return self._resolved_profile
 
     def get_transfer_time(
         self,
@@ -29,12 +46,10 @@ class AnalyticalKVCacheTransferPredictor(BaseKVCacheTransferPredictor):
         batch: "Batch",
         kv_cache_size_bytes: int,
     ) -> float:
-        effective_size_bytes = kv_cache_size_bytes
+        effective_size_bytes: float = float(kv_cache_size_bytes)
         if self._config.enable_compression:
             effective_size_bytes = kv_cache_size_bytes / self._config.compression_ratio
-
-        bandwidth_bytes_per_ms = (self._config.network_bandwidth_gbps * 1e9) / (8 * 1000)
-        return self._config.network_latency_ms + (effective_size_bytes / bandwidth_bytes_per_ms)
+        return self._resolved_profile.predict_time_ms(effective_size_bytes)
 
     def get_kv_cache_size(self, batch: "Batch", replica_config: "ReplicaConfig") -> int:
         total_tokens = sum(req.num_prefill_tokens for req in batch.requests)

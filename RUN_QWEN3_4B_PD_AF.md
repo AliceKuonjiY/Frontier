@@ -73,6 +73,14 @@ bash examples/architecture/pd-af-disagg/offline/qwen3_4b_pd_af.sh
 PYTHON_BIN=.venv/bin/python WEIGHT_STREAM_LAYERS=0 \
 HPP2_USABLE_MEMORY_MB=192 HPP2_PLANNING_OVERHEAD_MB=0 RUN_ID=diag_stream0 \
 bash examples/architecture/pd-af-disagg/offline/qwen3_4b_pd_af.sh
+
+# 按 P/D 节点放置自动查 LUT（默认 KV_PD_PLACEMENT=auto）：<=8 卡走 NVLink，>8 卡走 RDMA 400G
+PYTHON_BIN=.venv/bin/python PREFILL_REPLICAS=2 PREFILL_TP=2 DECODE_ATTN_REPLICAS=2 DECODE_ATTN_TP=2 \
+RUN_ID=g8_nvlink bash examples/architecture/pd-af-disagg/offline/qwen3_4b_pd_af.sh
+
+# 16 卡 NVLink 上界敏感性对照（需显式 override，输出 WARNING）或 RDMA 叠加固定延迟
+PYTHON_BIN=.venv/bin/python KV_PD_PLACEMENT=same_node KV_ALLOW_INFEASIBLE_PLACEMENT=1 \
+RUN_ID=sens_nvlink bash examples/architecture/pd-af-disagg/offline/qwen3_4b_pd_af.sh
 ```
 
 Metrics 输出到：
@@ -88,7 +96,9 @@ outputs/qwen3-4b-pd-af/qwen3_4b/offline_batch/<RUN_ID>/
 
 > **SRAM 预算口径说明（Issue #7）**：HPP2 单 Die 物理 APC DM 为 `192 MiB`（`201.33 MB`），SCALE 运行时固定保留 `22 MiB` 后可用上限为 **`170 MiB`**（`178.26 MB`），预留 **`10 MiB`**（4×80 KiB Bank0 碎片/规划余量）后有效权重+暂存+激活预算为 **`160 MiB`**（`167.77 MB`）。因此 `WEIGHT_STREAM_LAYERS=0/1` 均不可行（默认 fail fast），最小可行配置为 **`WEIGHT_STREAM_LAYERS=2`**（脚本当前默认值），`WEIGHT_STREAM_LAYERS=3` 亦可行。下方保留的 `stream-0` 数据仅为 Issue #7 修正前的历史理论对照，新版 `stream-2` baseline 与配比结果待后续统一重跑更新。
 
-默认 `ARRIVAL_PATTERN=burst` 让所有请求在时刻 0 到达，该模式下 `QPS` 不参与调度。下面两组权重策略沿用 PR #1 的 P→A NVLink 参考参数（3172.5 Gbit/s，启动延迟 0.0208 ms）。比较 GPU 与 GPU+LPU 时，两端应使用相同的到达序列和请求长度。
+> **KV 传输节点放置口径说明（Issue #10）**：`qwen3_4b_pd_af.sh` 现已改为默认消费 `kv_cache_transfer_lut.csv` 并按 `KV_PD_PLACEMENT=auto`（`P_cards + D_cards <= 8` 同节点、`> 8` 跨节点）自动选择链路：单节点（≤8 张 H200）走 **`NVLink_IntraNode`**（512 tok 实测中位数 `0.213 ms/req`），跨节点（12/16 卡等）走 **`RDMA_IB_400G_Direct`**（单链路 400 Gbps SOL，512 tok `1.510 ms/req`，差约 `+1.30 ms/req`）。对跨节点拓扑请求 `same_node` 默认 fail fast，需显式开启 `KV_ALLOW_INFEASIBLE_PLACEMENT=1` 方可做 NVLink 敏感性对照。下方保留的历史数值为 Issue #7/#10 修正前的 NVLink/stream-0 对照，新版 RDMA + `stream-2` 结果待后续统一重跑更新。
+
+默认 `ARRIVAL_PATTERN=burst` 让所有请求在时刻 0 到达，该模式下 `QPS` 不参与调度。下面两组权重策略沿用 PR #1 的 P→A NVLink 历史参考参数（3172.5 Gbit/s，启动延迟 0.0208 ms）；现行脚本默认按上述节点放置自动查 LUT（16 卡自动切 `RDMA_IB_400G_Direct`）。比较 GPU 与 GPU+LPU 时，两端应使用相同的到达序列和请求长度。
 
 `system_metrics.json` 的 `throughput_metrics.decode_tokens_per_second` 是整轮生成的输出 token 数除以从首个请求到达到最后一个请求完成的时间。`tokens_per_second` 使用同一分母，分子同时计入输入和输出。本轮两种口径的分子分别是 512 和 4,608；画解码输出吞吐图时取前者。
 
@@ -175,12 +185,17 @@ DECODE_FFN E2E    47.830 ms / 63 个后续 decode step
    - 两段串行，不要再用 122.44 Gbps 的 HostBounce 单段有效带宽，否则会重复计 PCIe。
    - 如果实测路径是 Direct RDMA，则 CPU 表应清零、M2N 用 366 Gbps；当前脚本默认按 HostBounce。
 
-## 从 LUT 拟合的 analytical 参数
+6. **PD 节点放置与 LUT 驱动 KV 传输计价（Issue #10）**
+   - 新增 `frontier/kv_cache_transfer/link_profile.py` 与 `AnalyticalKVCacheTransferConfig` 放置/LUT 字段：`auto` 按 `P + D <= num_devices_per_node` 自动在 `NVLink_IntraNode` 与 `RDMA_IB_400G_Direct` 间切换（默认 `piecewise_linear`，可选 `linear_fit` 与 `extra_latency_ms`）；跨节点请求 `same_node` 默认 fail fast，显式开启 `allow_infeasible_placement_override` 放行并输出 `WARNING`。
+   - `system_metrics.json` 的 `kv_cache_transfer_statistics` 与 `system_architecture_info.kv_cache_transfer_link` 输出 `link_type`、`pd_placement`、`placement_feasible`、`effective_bandwidth_gbps` 与 `topology_placement`。
+
+## 从 LUT 拟合的 analytical 参数与 KV LUT 口径
 
 | 路径 | 设置 |
 |---|---|
 | M2N HostBounce（分段） | IB 366 Gbps，0 ms latency，关闭 p2p speedup；每层 HPP2 PCIe 23 GB/s 在 CPU overhead 表 |
-| KV prefill→decode_attn（NVLink） | 3172.5 Gbps，0.0208 ms latency |
+| KV prefill→decode_attn（同节点 ≤8 H200） | `NVLink_IntraNode`（默认查 `kv_cache_transfer_lut.csv` 分段线性插值；512 tok 中位数 `0.213 ms`，OLS 拟合 3172.5 Gbps / 0.0208 ms） |
+| KV prefill→decode_attn（跨节点 >8 H200） | `RDMA_IB_400G_Direct`（默认查 `kv_cache_transfer_lut.csv`；单链路 400 Gbps SOL，0 ms α，512 tok `1.510 ms`，可用 `KV_EXTRA_LATENCY_MS` 做固定延迟敏感性） |
 | HPP2 ring all-reduce | 2984 Gbps 节点内，0 latency |
 | H200 clusters | 使用同一套 analytical CC 设置；未安装 H200 all-reduce 表 |
 

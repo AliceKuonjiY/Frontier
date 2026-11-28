@@ -585,3 +585,44 @@ def test_qwen3_4b_handles_trailing_cli_decode_ffn_overrides(tmp_path: Path) -> N
         "--cluster_config_decode_ffn_replica_config_usable_memory_mb",
         "180",
     ]
+
+
+def test_qwen3_4b_uses_kv_lut_and_placement_guards(tmp_path: Path) -> None:
+    argv = _capture_cli(tmp_path, "offline/qwen3_4b_pd_af.sh", env_overrides={"OUT_DIR": (tmp_path / "out").as_posix()})
+    assert _option_value(argv, "--analytical_kv_cache_transfer_config_pd_placement") == "auto"
+    assert _option_value(argv, "--analytical_kv_cache_transfer_config_lut_path").endswith("kv_cache_transfer_lut.csv")
+    assert "--analytical_kv_cache_transfer_config_network_bandwidth_gbps" not in argv
+    assert "--analytical_kv_cache_transfer_config_network_latency_ms" not in argv
+
+    # 16-card same_node fails fast without override
+    env = {**os.environ, "OUT_DIR": (tmp_path / "fail").as_posix(), "KV_PD_PLACEMENT": "same_node"}
+    res = subprocess.run(
+        ["bash", str(EXAMPLES_ROOT / "offline/qwen3_4b_pd_af.sh")],
+        cwd=REPO_ROOT, env=env, check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert res.returncode != 0 and "KV_ALLOW_INFEASIBLE_PLACEMENT=1" in res.stderr
+
+    # Explicit override passes sensitivity flag; 8-card topology accepts same_node cleanly
+    argv_sens = _capture_cli(
+        tmp_path, "offline/qwen3_4b_pd_af.sh",
+        env_overrides={
+            "OUT_DIR": (tmp_path / "sens").as_posix(),
+            "KV_PD_PLACEMENT": "same_node",
+            "KV_ALLOW_INFEASIBLE_PLACEMENT": "1",
+            "KV_EXTRA_LATENCY_MS": "0.02",
+        },
+    )
+    assert "--analytical_kv_cache_transfer_config_allow_infeasible_placement_override" in argv_sens
+    assert _option_value(argv_sens, "--analytical_kv_cache_transfer_config_extra_latency_ms") == "0.02"
+
+    argv_8g = _capture_cli(
+        tmp_path, "offline/qwen3_4b_pd_af.sh",
+        env_overrides={
+            "OUT_DIR": (tmp_path / "g8").as_posix(),
+            "PREFILL_REPLICAS": "2", "PREFILL_TP": "2",
+            "DECODE_ATTN_REPLICAS": "2", "DECODE_ATTN_TP": "2",
+            "KV_PD_PLACEMENT": "same_node",
+        },
+    )
+    assert _option_value(argv_8g, "--cluster_config_prefill_cluster_num_replicas") == "2"
+    assert "--analytical_kv_cache_transfer_config_allow_infeasible_placement_override" not in argv_8g

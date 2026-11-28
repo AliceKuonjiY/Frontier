@@ -388,6 +388,7 @@ class SimulationConfig(ABC):
         self._validate_sequential_checkpoint_observer_config()
         global_vars.set_global_vars(self.simulation_mode, self.sys_arch)
         self._validate_kv_connector()
+        self._validate_and_resolve_kv_cache_transfer_profile()
         global_vars.set_kv_connector(self.kv_cache_transfer_config.kv_connector)
         global_vars.set_kv_send_slowdown_per_layer_ms(
             self.kv_cache_transfer_config.kv_send_slowdown_per_layer_ms
@@ -429,6 +430,8 @@ class SimulationConfig(ABC):
         self.cluster_config.print_cluster_statistics(
             self.simulation_mode, self.sys_arch
         )
+        if getattr(self, "resolved_kv_cache_transfer_profile", None) is not None:
+            logger.info(self.resolved_kv_cache_transfer_profile.format_log_summary())
         self._normalize_metrics_output_dir()
         self.write_config_to_file()
 
@@ -616,6 +619,25 @@ class SimulationConfig(ABC):
                 f"kv_connector={kv_connector!r} prices the KV extract of PDD prefill steps; "
                 f"sys_arch={self.sys_arch!r} has none."
             )
+
+    def _validate_and_resolve_kv_cache_transfer_profile(self) -> None:
+        from frontier.kv_cache_transfer.link_profile import resolve_kv_cache_transfer_profile
+
+        kv_cfg = self.kv_cache_transfer_config
+        if not self.is_disaggregated_mode():
+            bad = [
+                k for k in ("pd_placement", "lut_path", "link_type", "allow_infeasible_placement_override")
+                if getattr(kv_cfg, k, None)
+            ]
+            if bad:
+                raise ValueError(
+                    f"PD KV placement/LUT options ({', '.join(bad)}) require a disaggregated sys_arch; got {self.sys_arch!r}."
+                )
+            self.resolved_kv_cache_transfer_profile = None
+            return
+        self.resolved_kv_cache_transfer_profile = resolve_kv_cache_transfer_profile(
+            kv_cfg, self.cluster_config, self.sys_arch
+        )
 
     def _validate_cuda_graph_config(self) -> None:
         valid_decode_cuda_graph_modes = {"none", "full_decode_only", "piecewise"}
